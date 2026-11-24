@@ -1,0 +1,25 @@
+{
+  "name": "periokey",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PerioKey: speak perio chart numbers, and they are typed into the dental software.",
+  "type": "module",
+  "packageManager": "pnpm@12.21.0",
+  "scripts": {
+    "start": "node src/server.ts",
+    "test": "node --test --test-concurrency=2 \"src/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
+    "@typescript-eslint/parser": "8.73.0",
+    "eslint": "10.15.0",
+    "eslint-plugin-oxlint": "1.94.0",
+    "oxlint": "1.94.0",
+    "prettier": "3.10.1",
+    "typescript": "6.0.3"
+  },
+  "dependencies": {
+    "ws": "^8.23.0"
+  }
+}

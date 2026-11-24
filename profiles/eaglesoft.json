@@ -1,0 +1,12 @@
+{
+  "name": "eaglesoft",
+  "label": "Patterson Eaglesoft",
+  "window_match": "Perio Exam",
+  "ten_to_fifteen": "not_set",
+  "after_each_depth": "none",
+  "bleeding": "b",
+  "undo": "backspace",
+  "skip": "right",
+  "inter_key_delay_ms": 40,
+  "bleeding_steps_back_first": false
+}

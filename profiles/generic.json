@@ -1,0 +1,12 @@
+{
+  "name": "generic",
+  "label": "Generic (any notepad or grid)",
+  "window_match": "",
+  "ten_to_fifteen": "two_digits",
+  "after_each_depth": "none",
+  "bleeding": "b",
+  "undo": "backspace",
+  "skip": "right",
+  "inter_key_delay_ms": 40,
+  "bleeding_steps_back_first": false
+}

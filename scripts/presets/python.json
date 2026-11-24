@@ -1,0 +1,78 @@
+{
+  "name": "python",
+  "formatStdin": "uv run ruff format --stdin-filename {file} -",
+  "extensions": [".py", ".pyi"],
+  "extraCodeExtensions": [],
+  "propertyTests": "hypothesis",
+  "checks": [
+    {
+      "name": "ruff lint",
+      "run": "uv run ruff check .",
+      "fast": true,
+      "protects": "Common bugs and risky patterns Ruff knows, such as unused imports and names used before they are set.",
+      "misses": "Wrong logic, and type mistakes; Pyrefly checks types."
+    },
+    {
+      "name": "ruff format",
+      "run": "uv run ruff format --check .",
+      "fast": true,
+      "protects": "Every file is laid out the one Ruff way, so a change shows only what it really changes.",
+      "misses": "Anything about what the code does; it looks at layout only."
+    },
+    {
+      "name": "pyrefly",
+      "run": "uv run pyrefly check",
+      "fast": true,
+      "protects": "Values used as the wrong type, missing attributes, and calls with the wrong arguments.",
+      "misses": "Code with no type hints is checked less, and data from outside is never checked."
+    },
+    {
+      "name": "pytest",
+      "run": "uv run pytest",
+      "slot": true,
+      "protects": "Behavior the tests describe.",
+      "misses": "Behavior no test describes, and tests that pass whatever the code does."
+    },
+    {
+      "name": "uv audit",
+      "run": "uv audit",
+      "protects": "Installed packages with a known security hole.",
+      "misses": "Holes nobody has reported yet, and needs the network to run."
+    }
+  ],
+  "switchOffs": [
+    { "pattern": "#\\s*[Nn][Oo][Qq][Aa]\\b", "kind": "lint", "what": "noqa comment switches off Ruff rules on this line" },
+    { "pattern": "#\\s*(?:ruff|flake8)\\s*:\\s*[Nn][Oo][Qq][Aa]\\b", "kind": "lint", "what": "ruff: noqa or flake8: noqa switches off Ruff rules for the whole file" },
+    { "pattern": "#\\s*ruff\\s*:\\s*(?:ignore|file-ignore|disable)\\s*\\[", "kind": "lint", "what": "ruff: ignore, file-ignore, or disable switches off Ruff rules for a line, a range, or the file" },
+    { "pattern": "#\\s*type\\s*:\\s*ignore\\b", "kind": "types", "what": "type: ignore switches off the type check on this line" },
+    { "pattern": "#\\s*pyrefly\\s*:\\s*ignore", "kind": "types", "what": "pyrefly: ignore switches off the type check here" },
+    { "pattern": "#\\s*fmt\\s*:\\s*(off|skip)\\b", "kind": "format", "what": "fmt: off or fmt: skip switches off the formatter" },
+    { "pattern": "#\\s*pragma\\s*:\\s*no\\s*cover\\b", "kind": "coverage", "what": "pragma: no cover hides code from the test coverage count" }
+  ],
+  "switchOffFiles": [],
+  "skippedTests": [
+    { "pattern": "@pytest\\.mark\\.(skip|skipif|xfail)\\b", "what": "pytest mark that skips a test or expects it to fail" },
+    { "pattern": "\\bpytest\\.(skip|xfail)\\s*\\(", "what": "pytest call that skips a running test" },
+    { "pattern": "@unittest\\.(skip|skipIf|skipUnless|expectedFailure)\\b", "what": "unittest marker that skips a test or expects it to fail" }
+  ],
+  "assertions": [
+    { "pattern": "^\\s*assert\\b", "what": "plain assert, as pytest uses it" },
+    { "pattern": "\\bself\\.assert\\w*\\s*\\(", "what": "unittest assert method" },
+    { "pattern": "\\bpytest\\.raises\\s*\\(", "what": "pytest check that an error is raised" }
+  ],
+  "testNames": [
+    { "pattern": "^\\s*(?:async\\s+)?def\\s+(?<name>test\\w*)\\s*\\(", "what": "a test function" },
+    { "pattern": "^\\s*class\\s+(?<name>Test\\w*)", "what": "a test class" }
+  ],
+  "flakyWorkarounds": [
+    { "kind": "wait-added", "pattern": "\\b(?:time\\s*\\.\\s*|asyncio\\s*\\.\\s*)?sleep\\s*\\(\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)\\s*\\)", "what": "time.sleep or asyncio.sleep is a fixed wait" },
+    { "kind": "timeout-raised", "pattern": "@pytest\\s*\\.\\s*mark\\s*\\.\\s*timeout\\s*\\(\\s*(?:timeout\\s*=\\s*)?(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)?", "what": "pytest.mark.timeout sets a time limit" },
+    { "kind": "timeout-raised", "pattern": "--timeout(?:=|\\s+)(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)", "what": "the --timeout option sets a time limit (pytest-timeout)" },
+    { "kind": "timeout-raised", "pattern": "^timeout\\s*=\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)", "what": "timeout in pytest settings sets a time limit", "where": "settings" },
+    { "kind": "timeout-raised", "pattern": "\\bdeadline\\s*=\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*|None)", "what": "a Hypothesis deadline is a time limit; None takes it away" },
+    { "kind": "retry-added", "pattern": "@pytest\\s*\\.\\s*mark\\s*\\.\\s*flaky\\b(?:\\s*\\(\\s*(?:reruns|max_runs)\\s*=\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*))?", "what": "pytest.mark.flaky runs a failing test again" },
+    { "kind": "retry-added", "pattern": "@flaky\\b(?:\\s*\\(\\s*max_runs\\s*=\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*))?", "what": "the flaky decorator runs a failing test again" },
+    { "kind": "retry-added", "pattern": "--reruns(?:=|\\s+)(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)", "what": "the --reruns option runs failing tests again (pytest-rerunfailures)" },
+    { "kind": "retry-added", "pattern": "^reruns\\s*=\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)", "what": "reruns in pytest settings runs failing tests again", "where": "settings" }
+  ]
+}

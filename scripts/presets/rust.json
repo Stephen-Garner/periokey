@@ -1,0 +1,60 @@
+{
+  "name": "rust",
+  "extensions": [".rs"],
+  "extraCodeExtensions": [],
+  "propertyTests": "proptest",
+  "checks": [
+    {
+      "name": "rustfmt",
+      "run": "cargo fmt --check",
+      "fast": true,
+      "protects": "Every file is laid out the one rustfmt way, so a change shows only what it really changes.",
+      "misses": "Anything about what the code does; it looks at layout only."
+    },
+    {
+      "name": "clippy",
+      "run": "cargo clippy --all-targets -- -D warnings -F unsafe_code",
+      "fast": true,
+      "protects": "Common bugs and risky patterns Clippy knows, and any unsafe code, tests included (forbidden, so no allow can switch it back on); any warning fails.",
+      "misses": "Wrong logic that compiles cleanly, and unsafe code inside macros from other crates."
+    },
+    {
+      "name": "cargo check",
+      "run": "cargo check",
+      "fast": true,
+      "protects": "Type errors, borrow errors, and anything else that stops the code from compiling.",
+      "misses": "Wrong values of the right type."
+    },
+    {
+      "name": "cargo test",
+      "run": "cargo test",
+      "slot": true,
+      "protects": "Behavior the tests describe.",
+      "misses": "Behavior no test describes, and tests that pass whatever the code does."
+    },
+    {
+      "name": "cargo audit",
+      "run": "cargo audit",
+      "protects": "Crates in Cargo.lock with a known security hole.",
+      "misses": "Holes nobody has reported yet; needs the network and the cargo-audit tool installed."
+    }
+  ],
+  "switchOffs": [
+    { "pattern": "#!?\\[\\s*(?:cfg_attr\\s*\\(.*?\\b)?(allow|expect)\\s*\\(", "kind": "lint", "what": "allow or expect attribute switches off a compiler or Clippy warning" }
+  ],
+  "switchOffFiles": [],
+  "skippedTests": [
+    { "pattern": "#\\[ignore\\b", "what": "ignore attribute that skips a test" }
+  ],
+  "assertions": [
+    { "pattern": "\\b(debug_)?assert(_eq|_ne)?!\\s*\\(", "what": "assert!, assert_eq!, or assert_ne!" },
+    { "pattern": "#\\[should_panic\\b", "what": "should_panic attribute that expects a crash" }
+  ],
+  "testNames": [
+    { "pattern": "^\\s*(?:pub\\s+)?(?:async\\s+)?fn\\s+(?<name>\\w+)\\s*[(<]", "what": "a function in a test file (Rust marks tests with #[test] on the line above)" }
+  ],
+  "flakyWorkarounds": [
+    { "kind": "wait-added", "pattern": "\\b(?:(?:std|tokio)::)?(?:thread|time)::sleep\\s*\\(\\s*(?:(?:std::)?(?:time::)?Duration::from_(?:secs|millis|micros|nanos)\\s*\\(\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)\\s*\\)\\s*\\))?", "what": "thread::sleep or tokio::time::sleep is a fixed wait" },
+    { "kind": "timeout-raised", "pattern": "\\b(?:(?:tokio::)?time::)?timeout\\s*\\(\\s*(?:(?:std::)?(?:time::)?Duration::from_(?:secs|millis|micros|nanos)\\s*\\(\\s*)?(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)?", "what": "timeout(Duration) sets a time limit" }
+  ]
+}

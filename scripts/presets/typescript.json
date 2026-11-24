@@ -1,0 +1,91 @@
+{
+  "name": "typescript",
+  "formatStdin": "pnpm exec prettier --stdin-filepath {file}",
+  "extensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"],
+  "extraCodeExtensions": [".vue", ".svelte", ".astro", ".mdx"],
+  "propertyTests": "fast-check",
+  "checks": [
+    {
+      "name": "format",
+      "run": "pnpm exec prettier --check .",
+      "fast": true,
+      "protects": "Every code and settings file is laid out the one Prettier way, so a change shows only what it really changes.",
+      "misses": "Markdown and kit-managed files (left out in .prettierignore), and anything about what the code does."
+    },
+    {
+      "name": "oxlint",
+      "run": "pnpm exec oxlint -f json . | node kit-lint/hints.mjs",
+      "fast": true,
+      "protects": "Common bugs and risky patterns Oxlint knows, such as unused variables and unreachable code.",
+      "misses": "The kit's own rules and plugin rules Oxlint does not support; ESLint runs those."
+    },
+    {
+      "name": "eslint",
+      "run": "pnpm exec eslint -f json . | node kit-lint/hints.mjs",
+      "fast": true,
+      "protects": "The kit's own rules (comment ban, no skipped tests, no missing packages) and plugin rules Oxlint lacks.",
+      "misses": "Rules Oxlint already runs (switched off here so nothing runs twice), and wrong logic."
+    },
+    {
+      "name": "tsc",
+      "run": "pnpm exec tsc --noEmit",
+      "fast": true,
+      "protects": "Values used as the wrong type, missing fields, and calls with the wrong arguments.",
+      "misses": "Wrong values of the right type, and data from outside the program that is never checked."
+    },
+    {
+      "name": "test",
+      "run": "echo 'Fill in this check: put the project test command in scripts/kit.config.json' >&2; exit 1",
+      "slot": true,
+      "protects": "Behavior the tests describe; fill in the project's test command.",
+      "misses": "Behavior no test describes, and tests that pass whatever the code does."
+    },
+    {
+      "name": "pnpm audit",
+      "run": "pnpm audit",
+      "protects": "Installed packages with a known security hole.",
+      "misses": "Holes nobody has reported yet, and needs the network to run."
+    }
+  ],
+  "switchOffs": [
+    { "pattern": "eslint-disable", "kind": "lint", "what": "eslint-disable comment switches off an ESLint rule" },
+    { "pattern": "oxlint-disable", "kind": "lint", "what": "oxlint-disable comment switches off an Oxlint rule" },
+    { "pattern": "@ts-ignore", "kind": "types", "what": "@ts-ignore switches off the type check on the next line" },
+    { "pattern": "@ts-expect-error", "kind": "types", "what": "@ts-expect-error switches off the type check on the next line" },
+    { "pattern": "@ts-nocheck", "kind": "types", "what": "@ts-nocheck switches off the type check for the whole file" },
+    { "pattern": "prettier-ignore", "kind": "format", "what": "prettier-ignore switches off the formatter" },
+    { "pattern": "(istanbul|c8) ignore", "kind": "coverage", "what": "a coverage ignore comment hides code from the test coverage count" }
+  ],
+  "switchOffFiles": [],
+  "skippedTests": [
+    { "pattern": "\\b(describe|it|test|suite|bench)\\s*(?:\\.\\s*|\\[\\s*['\"`])(skip|only|todo|fails|skipIf|runIf)\\b", "what": "Jest or Vitest skip, focus, or todo marker, written with a dot or in brackets" },
+    { "pattern": "\\b(xit|xdescribe|xtest|fit|fdescribe)\\s*\\(", "what": "Jest x or f prefix that skips or focuses a test" },
+    { "pattern": "\\b(skip|only|todo)['\"`]?\\s*:\\s*(true|['\"`])", "what": "Node test runner option that skips or focuses a test" },
+    { "pattern": "\\bt\\s*(?:\\.\\s*(skip|todo)|\\[\\s*['\"`](skip|todo)['\"`]\\s*\\])\\s*\\(", "what": "Node test runner call that skips a running test" }
+  ],
+  "assertions": [
+    { "pattern": "\\bexpect\\s*\\(", "what": "Jest or Vitest expect" },
+    { "pattern": "\\bassert(\\.\\w+)*\\s*\\(", "what": "Node assert, assert.equal, or t.assert.equal" }
+  ],
+  "testNames": [
+    { "pattern": "\\b(?:x|f)?(?:describe|it|test|suite)(?:\\s*\\.\\s*\\w+|\\s*\\[\\s*['\"`]\\w+['\"`]\\s*\\])*(?:\\s*\\([^()]*\\))?\\s*\\(\\s*(['\"`])(?<name>.*?)\\1", "what": "the name given to describe, it, test, or suite, with x or f in front, a marker after a dot or in brackets, or after .skipIf(x) or .runIf(x)" }
+  ],
+  "flakyWorkarounds": [
+    { "kind": "timeout-raised", "pattern": "\\b(?:jest|vi|test|this|mocha)\\s*\\.\\s*(?:setTimeout|timeout)\\s*\\(\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*|Infinity)?", "what": "jest.setTimeout, test.setTimeout, or this.timeout sets a time limit" },
+    { "kind": "timeout-raised", "pattern": "(?:\\b\\w+\\s*\\.\\s*)?setDefault(?:Navigation)?Timeout\\s*\\(\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)?", "what": "Playwright setDefaultTimeout sets a time limit" },
+    { "kind": "timeout-raised", "pattern": "^\\s*(?:it|test|describe|suite|bench)\\b(?:\\s*\\.\\s*\\w+)*\\s*\\(\\s*(?:(?:'[^']*'|\"[^\"]*\"|`[^`]*`|[\\w$.]+)\\s*,\\s*)?\\{[^{}]*\\btimeout['\"]?\\s*:\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*|Infinity)?", "what": "a timeout in the options object given straight to a test, a suite, or describe.configure sets a time limit", "where": "tests" },
+    { "kind": "timeout-raised", "pattern": "\\b(?:testTimeout|hookTimeout|teardownTimeout)['\"]?\\s*:\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*|Infinity)?", "what": "testTimeout, hookTimeout, or teardownTimeout sets a time limit" },
+    { "kind": "timeout-raised", "pattern": "\\btimeout['\"]?\\s*:\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*|Infinity)?", "what": "a timeout key in the test settings sets a time limit", "where": "settings" },
+    { "kind": "timeout-raised", "pattern": "^\\s*\\}\\s*,\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*|Infinity)\\s*\\)\\s*;?\\s*$", "what": "a number after a test body is its time limit (Jest, Vitest)" },
+    { "kind": "timeout-raised", "pattern": "^\\s*(?:it|test)\\b.*\\}\\s*,\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*|Infinity)\\s*\\)\\s*;?\\s*$", "what": "a number after a one-line test body is its time limit" },
+    { "kind": "wait-added", "pattern": "\\bPromise\\s*\\(\\s*\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{?\\s*setTimeout\\s*\\(\\s*\\1\\s*,\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)\\s*\\)", "what": "a promise that resolves after a setTimeout is a fixed wait" },
+    { "kind": "wait-added", "pattern": "\\bsetTimeout\\s*\\(\\s*(?:resolve|res|r)\\s*,\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)\\s*\\)", "what": "setTimeout(resolve, ms) is a fixed wait" },
+    { "kind": "wait-added", "pattern": "(?<![.\\w])setTimeout\\s*\\(\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)\\s*[,)]", "what": "await setTimeout(ms) from node:timers/promises is a fixed wait" },
+    { "kind": "wait-added", "pattern": "\\b(?:sleep|delay|wait)\\s*\\(\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)\\s*\\)", "what": "sleep, delay, or wait with a number is a fixed wait" },
+    { "kind": "wait-added", "pattern": "(?:\\b\\w+\\s*\\.\\s*)?waitForTimeout\\s*\\(\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)?", "what": "Playwright waitForTimeout is a fixed wait" },
+    { "kind": "retry-added", "pattern": "(?:\\b\\w+\\s*\\.\\s*)?retryTimes\\s*\\(\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)?", "what": "jest.retryTimes runs a failing test again" },
+    { "kind": "retry-added", "pattern": "^\\s*(?:it|test|describe|suite|bench)\\b(?:\\s*\\.\\s*\\w+)*\\s*\\(\\s*(?:(?:'[^']*'|\"[^\"]*\"|`[^`]*`|[\\w$.]+)\\s*,\\s*)?\\{[^{}]*\\b(?:retries|retry)['\"]?\\s*:\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)?", "what": "a retry in the options object given straight to a test, a suite, or describe.configure runs a failing test again", "where": "tests" },
+    { "kind": "retry-added", "pattern": "\\b(?:retries|retry)['\"]?\\s*:\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)?", "what": "a retries or retry key in the test settings runs failing tests again", "where": "settings" },
+    { "kind": "retry-added", "pattern": "\\b\\w+\\s*\\.\\s*retries\\s*\\(\\s*(?<value>(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+)(?:\\s*\\*\\s*(?:\\d[\\d_]*(?:\\.\\d+)?|\\.\\d+))*)?", "what": "this.retries runs a failing test again (Mocha)" }
+  ]
+}

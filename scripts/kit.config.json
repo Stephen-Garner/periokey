@@ -1,0 +1,125 @@
+{
+  "models": {
+    "headAgent": [
+      "antigravity/gemini-4-neon"
+    ],
+    "builder": "claude/claude-opus-5-5",
+    "reviewer": "codex/gpt-6.2-astra"
+  },
+  "checks": [
+    {
+      "name": "format",
+      "run": "pnpm exec prettier --check .",
+      "fast": true,
+      "protects": "Every code and settings file is laid out the one Prettier way, so a change shows only what it really changes.",
+      "misses": "Markdown and kit-managed files (left out in .prettierignore), and anything about what the code does."
+    },
+    {
+      "name": "oxlint",
+      "run": "pnpm exec oxlint -f json . | node kit-lint/hints.mjs",
+      "fast": true,
+      "protects": "Common bugs and risky patterns Oxlint knows, such as unused variables and unreachable code.",
+      "misses": "The kit's own rules and plugin rules Oxlint does not support; ESLint runs those."
+    },
+    {
+      "name": "eslint",
+      "run": "pnpm exec eslint -f json . | node kit-lint/hints.mjs",
+      "fast": true,
+      "protects": "The kit's own rules (comment ban, no skipped tests, no missing packages) and plugin rules Oxlint lacks.",
+      "misses": "Rules Oxlint already runs (switched off here so nothing runs twice), and wrong logic."
+    },
+    {
+      "name": "tsc",
+      "run": "pnpm exec tsc --noEmit",
+      "fast": true,
+      "protects": "Values used as the wrong type, missing fields, and calls with the wrong arguments.",
+      "misses": "Wrong values of the right type, and data from outside the program that is never checked."
+    },
+    {
+      "name": "test",
+      "run": "pnpm test",
+      "slot": true,
+      "protects": "Behavior the tests in src/ describe (parser, key encoding, speech adapters, settings), run by the Node test runner with at most 2 workers.",
+      "misses": "Behavior no test describes, and tests that pass whatever the code does."
+    },
+    {
+      "name": "pnpm audit",
+      "run": "pnpm audit",
+      "protects": "Installed packages with a known security hole.",
+      "misses": "Holes nobody has reported yet, and needs the network to run."
+    },
+    {
+      "name": "secrets",
+      "run": "gitleaks git --redact --no-banner --ignore-gitleaks-allow --config kit-lint/gitleaks.toml",
+      "protects": "Passwords, keys, and tokens written into any commit, including old ones.",
+      "misses": "Secrets in a shape the kit gitleaks settings do not know, and files git does not track."
+    },
+    {
+      "name": "switch-offs",
+      "run": "node scripts/switch-offs.mjs",
+      "fast": true,
+      "protects": "No comment in product code switches off a check, and no file that switches checks off is tracked anywhere.",
+      "misses": "Rules switched off in the settings files, and code outside productPaths or in notYetClean folders."
+    },
+    {
+      "name": "ratchets",
+      "run": "node scripts/ratchets.mjs check --all",
+      "fast": true,
+      "protects": "Counts in kit.ratchets.json (switch-offs, useEffect uses, flag groups) never go up.",
+      "misses": "Whether today's counted uses are right; it only stops new ones."
+    }
+  ],
+  "paperworkPaths": [
+    "docs/",
+    "AGENTS.md"
+  ],
+  "planMaxBytes": 12288,
+  "features": {
+    "protectedTests": false,
+    "reviewReceipts": false,
+    "mergeLock": false,
+    "duplicateNumbers": false,
+    "blockLog": false,
+    "claimCheck": false,
+    "events": true,
+    "testReasons": true,
+    "incomingCommits": true,
+    "verifiedStamp": "observe",
+    "changeChecklist": "observe",
+    "reviewLevels": "observe",
+    "securityReview": "observe",
+    "findingAnswers": "observe"
+  },
+  "numberedPaths": [
+    "docs/plans/",
+    "docs/decisions/"
+  ],
+  "testPaths": [
+    ".test.",
+    ".spec.",
+    "__tests__/",
+    "__snapshots__/",
+    "tests/",
+    "test/"
+  ],
+  "presets": [
+    "typescript"
+  ],
+  "productPaths": [
+    "src/",
+    "public/",
+    "profiles/"
+  ],
+  "notYetClean": [],
+  "highRiskPaths": [
+    "src/parser.ts",
+    "src/keymap.ts",
+    "src/injector.ts",
+    "src/win-helper.ps1",
+    "profiles/"
+  ],
+  "quickReviewPaths": [],
+  "quickReviewMaxLines": 50,
+  "maxReviewRounds": 10,
+  "extraReviewRoundSlices": []
+}

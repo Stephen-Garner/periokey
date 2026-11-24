@@ -1,0 +1,44 @@
+#!/bin/sh
+# Runs the rule checker before every commit, on exactly what is about to be committed.
+# Then, when the repo has a lefthook config, runs its pre-commit checks (format, lint, secret scan) on staged files.
+# From the starter kit.
+# Turn it on once per clone:  git config core.hooksPath .githooks
+# Never skip it with --no-verify: builders and head agents both pass it, or fix the problem.
+node scripts/check-plans.mjs --staged || {
+  echo ""
+  echo "Commit blocked by the rule checks above."
+  exit 1
+}
+
+# Every name lefthook reads its settings from. A "local" file is merged on top of the main one.
+config=""
+local_file=""
+for base in lefthook .lefthook .config/lefthook; do
+  for ext in yml yaml json jsonc toml; do
+    [ -f "$base.$ext" ] && [ -z "$config" ] && config="$base.$ext"
+    [ -f "$base-local.$ext" ] && [ -z "$local_file" ] && local_file="$base-local.$ext"
+  done
+done
+
+if [ -z "$config" ]; then
+  [ -d kit-lint ] || exit 0
+  echo "Commit blocked: this project has kit-lint/ but no lefthook.yml, so format, lint, and secret checks would not run."
+  echo "Put it back: git checkout HEAD -- lefthook.yml, or copy template/lefthook.yml from the starter kit."
+  exit 1
+fi
+# Why: a local file is kept out of git, so it could switch a check off on one machine with no trace.
+if [ -n "$local_file" ]; then
+  echo "Commit blocked: $local_file changes the commit checks on this machine only. Delete it, and change $config instead, in the open."
+  exit 1
+fi
+command -v lefthook >/dev/null 2>&1 || {
+  echo "Commit blocked: lefthook is not installed. Install it with: brew install lefthook gitleaks"
+  exit 1
+}
+# --no-auto-install: lefthook must not write its own hook files over the kit's.
+# env -u: LEFTHOOK=0, LEFTHOOK_EXCLUDE, and LEFTHOOK_CONFIG would each switch checks off.
+env -u LEFTHOOK -u LEFTHOOK_EXCLUDE -u LEFTHOOK_CONFIG lefthook run pre-commit --no-auto-install || {
+  echo ""
+  echo "Commit blocked by the checks above ($config)."
+  exit 1
+}

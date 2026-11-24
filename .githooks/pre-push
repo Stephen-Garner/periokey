@@ -1,0 +1,16 @@
+#!/bin/sh
+# Refuses any push to the protected branch. Changes reach it only through pull requests.
+# From the starter kit.
+# Why: a free stand-in for GitHub branch protection, which needs a paid plan on a private repo.
+# In UniLex on 2026-11-04 a head agent's `git checkout main` in a shared folder put another
+# thread's commit straight onto main.
+# Turn it on once per clone:  git config core.hooksPath .githooks
+# Protected branch: "main" unless set with  git config hooks.protectedBranch <name>
+protected="$(git config --get hooks.protectedBranch || echo main)"
+while read local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = "refs/heads/$protected" ]; then
+    echo "Push to $protected blocked: open a pull request and merge it with scripts/merge-pr.mjs (docs/agents/core.md, CORE-10)."
+    exit 1
+  fi
+done
+exit 0

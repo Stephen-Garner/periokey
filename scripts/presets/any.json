@@ -1,0 +1,39 @@
+{
+  "name": "any",
+  "extensions": [],
+  "extraCodeExtensions": [],
+  "checks": [
+    {
+      "name": "secrets",
+      "run": "gitleaks git --redact --no-banner --ignore-gitleaks-allow --config kit-lint/gitleaks.toml",
+      "protects": "Passwords, keys, and tokens written into any commit, including old ones.",
+      "misses": "Secrets in a shape the kit gitleaks settings do not know, and files git does not track."
+    },
+    {
+      "name": "switch-offs",
+      "run": "node scripts/switch-offs.mjs",
+      "fast": true,
+      "protects": "No comment in product code switches off a check, and no file that switches checks off is tracked anywhere.",
+      "misses": "Rules switched off in the settings files, and code outside productPaths or in notYetClean folders."
+    },
+    {
+      "name": "ratchets",
+      "run": "node scripts/ratchets.mjs check --all",
+      "fast": true,
+      "protects": "Counts in kit.ratchets.json (switch-offs, useEffect uses, flag groups) never go up.",
+      "misses": "Whether today's counted uses are right; it only stops new ones."
+    }
+  ],
+  "switchOffs": [
+    { "pattern": "gitleaks:allow", "kind": "secrets", "what": "gitleaks:allow comment hides a line from the secret scan" }
+  ],
+  "switchOffFiles": [
+    { "name": "oxlint-suppressions.json", "what": "oxlint-suppressions.json switches Oxlint rules off for whole files; delete it and fix the code" },
+    { "name": "eslint-suppressions.json", "what": "eslint-suppressions.json switches ESLint rules off for whole files; delete it and fix the code" },
+    { "name": ".gitleaksignore", "what": ".gitleaksignore hides found secrets from the secret scan; delete it, and remove and replace any real secret" },
+    { "name": ".gitleaks.toml", "what": ".gitleaks.toml changes the secret scan settings so it can let secrets through; delete it (the kit settings in kit-lint/gitleaks.toml are used)" }
+  ],
+  "skippedTests": [],
+  "assertions": [],
+  "testNames": []
+}

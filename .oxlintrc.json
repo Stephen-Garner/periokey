@@ -1,0 +1,5 @@
+{
+  "extends": ["./kit-lint/oxlintrc.base.json"],
+  "ignorePatterns": ["kit-lint/**"],
+  "rules": {}
+}

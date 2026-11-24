@@ -1,0 +1,14 @@
+# Files Prettier skips. From the starter kit; the project owns this file.
+
+# Kit-managed files: the kit keeps them in its own format, and the project never edits them.
+kit-lint/
+docs/agents/
+.githooks/
+scripts/
+
+# Written by tools and scripts, not by hand.
+pnpm-lock.yaml
+kit.ratchets.json
+
+# Markdown: kit scripts add table rows one at a time, and Prettier would realign every table.
+*.md

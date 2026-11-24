@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PerioKey</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>PerioKey</h1>
+        <span id="status" class="pill" data-status="Paused">Paused</span>
+      </header>
+
+      <div class="controls">
+        <button id="toggle" class="toggle" type="button">
+          Start listening
+        </button>
+        <button id="float" type="button" title="Always-on-top button (Chrome)">
+          Float button
+        </button>
+      </div>
+      <div id="mic" class="mic" hidden>
+        <div class="meter" aria-hidden="true"><span id="level"></span></div>
+        <p class="hint">
+          Keep Listening on — say numbers like "three two three" and pause half
+          a second.
+        </p>
+      </div>
+      <p id="note" class="note" hidden></p>
+
+      <dl class="facts">
+        <dt>Speech</dt>
+        <dd id="provider">...</dd>
+        <dt>Mic</dt>
+        <dd>
+          <select id="micDevice" aria-label="Microphone"></select>
+        </dd>
+        <dt>Software</dt>
+        <dd>
+          <select id="profile" aria-label="Dental software profile"></select>
+        </dd>
+        <dt>Mode</dt>
+        <dd class="modes" role="radiogroup" aria-label="Mode">
+          <button type="button" data-mode="practice" role="radio">
+            Practice
+          </button>
+          <button type="button" data-mode="live" role="radio">Live</button>
+        </dd>
+        <dt>Target</dt>
+        <dd id="target">...</dd>
+      </dl>
+
+      <section aria-label="Last entries">
+        <h2>Last entries</h2>
+        <ol id="recent" class="recent"></ol>
+      </section>
+
+      <section id="practice" aria-label="Practice chart">
+        <h2>
+          Practice chart
+          <button id="clear" type="button" class="link">clear</button>
+        </h2>
+        <div id="grid" class="grid"></div>
+        <form id="simulate" class="simulate">
+          <input
+            id="phrase"
+            type="text"
+            placeholder='Type a phrase, like "three two three"'
+            autocomplete="off"
+          />
+          <button type="submit">Say it</button>
+        </form>
+        <p class="keys">Keys sent: <span id="keys">none yet</span></p>
+        <p id="heard" class="keys" aria-live="polite"></p>
+        <h2>
+          Cadence log
+          <button id="copyLog" type="button" class="link">copy log</button>
+        </h2>
+        <p id="cadence" class="keys"></p>
+        <ol id="log" class="log"></ol>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "flag groups": 0,
+    "switch-offs coverage": 0,
+    "switch-offs format": 0,
+    "switch-offs lint": 0,
+    "switch-offs secrets": 0,
+    "switch-offs types": 0,
+    "useEffect uses": 0
+  },
+  "counters": [
+    {
+      "name": "flag groups",
+      "needs": [
+        "kit-lint/eslint.base.mjs",
+        "node_modules/.bin/eslint"
+      ],
+      "run": "pnpm exec eslint --rule '{\"kit/flag-groups\":\"error\"}' --format json . | node -e \"let s='';process.stdin.on('data',(d)=>{s+=d}).on('end',()=>{console.log(JSON.parse(s).flatMap((f)=>f.messages).filter((m)=>m.ruleId==='kit/flag-groups').length)})\""
+    }
+  ]
+}

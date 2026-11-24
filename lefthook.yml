@@ -1,0 +1,33 @@
+# Checks that run on every commit, on the staged files only. From the starter kit; the project owns this file.
+# .githooks/pre-commit runs them with "lefthook run pre-commit", after the plan checker.
+# Budget: under 10 seconds on a normal commit. A check that grows past that moves to scripts/merge-pr.mjs.
+# Install once per Mac: brew install lefthook gitleaks
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: format
+      run: pnpm exec prettier --check --ignore-unknown {staged_files}
+
+    - name: oxlint
+      glob: "*.{js,mjs,cjs,jsx,ts,mts,cts,tsx}"
+      run: pnpm exec oxlint -f json --no-error-on-unmatched-pattern {staged_files} | node kit-lint/hints.mjs
+
+    - name: eslint
+      glob: "*.{js,mjs,cjs,jsx,ts,mts,cts,tsx}"
+      run: pnpm exec eslint -f json --no-warn-ignored {staged_files} | node kit-lint/hints.mjs
+
+    # --config: the kit's settings only, so a project .gitleaks.toml can never hide a file from the scan.
+    # gitleaks reads .gitleaksignore from the folder it runs in, tracked or not, so that file stops the job.
+    - name: secrets
+      run: >-
+        { [ ! -e .gitleaksignore ] || { echo "Secret scan refused: .gitleaksignore hides found secrets from the scan. Delete it. Remove any real secret from the code and replace it with a new one."; exit 1; }; }
+        && command -v gitleaks >/dev/null || { echo "gitleaks is not installed. Install it with: brew install gitleaks"; exit 1; }
+        && gitleaks git --staged --redact --no-banner --ignore-gitleaks-allow --config kit-lint/gitleaks.toml
+        --log-level error --report-format json --report-path - | node kit-lint/hints.mjs
+
+    - name: switch-offs
+      run: node scripts/switch-offs.mjs --staged
+
+    - name: ratchets
+      run: node scripts/ratchets.mjs check

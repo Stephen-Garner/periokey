@@ -1,0 +1,10 @@
+#!/bin/sh
+# Checks the commit message: "type: description", a Slice line on build branches, a Fixes line on fixes.
+# From the starter kit. Git calls it with the path of the message file as $1.
+# Turn it on once per clone:  git config core.hooksPath .githooks
+# Never skip it with --no-verify: fix the message instead.
+node scripts/commit-msg.mjs "$1" || {
+  echo ""
+  echo "Commit blocked by the message check above."
+  exit 1
+}

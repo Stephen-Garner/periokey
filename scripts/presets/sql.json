@@ -1,0 +1,36 @@
+{
+  "name": "sql",
+  "extensions": [".sql"],
+  "extraCodeExtensions": [],
+  "checks": [
+    {
+      "name": "sqlfluff",
+      "run": "sqlfluff lint .",
+      "fast": true,
+      "protects": "SQL that breaks the rules of the database type set as dialect in the project's .sqlfluff file.",
+      "misses": "Whether a migration is safe on a live table, and whether the SQL does what was meant."
+    },
+    {
+      "name": "squawk",
+      "run": "if [ ! -f .sqlfluff ]; then echo \"squawk: .sqlfluff is missing, so the database type is not known. Add it with a line like: dialect = postgres\" >&2; exit 1; elif grep -Eqs '^dialect *= *postgres' .sqlfluff; then squawk migrations/*.sql; else echo 'squawk: not run, the database is not Postgres (dialect in .sqlfluff)'; fi",
+      "fast": true,
+      "protects": "Postgres migrations that would lock a live table or break running code, such as a new required column.",
+      "misses": "Every database but Postgres, and migration files outside the migrations/ folder."
+    },
+    {
+      "name": "sql migrations",
+      "run": "echo 'Fill in this check: a command that applies every migration to an empty test database' >&2; exit 1",
+      "slot": true,
+      "protects": "Every migration file runs, in order, on an empty database; fill in the project's command.",
+      "misses": "Problems that show only with real data or a live database."
+    }
+  ],
+  "switchOffs": [
+    { "pattern": "--\\s*noqa\\b", "kind": "lint", "what": "noqa comment switches off a SQLFluff rule" },
+    { "pattern": "squawk-ignore", "kind": "lint", "what": "squawk-ignore switches off a Squawk rule" }
+  ],
+  "switchOffFiles": [],
+  "skippedTests": [],
+  "assertions": [],
+  "testNames": []
+}

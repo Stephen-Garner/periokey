@@ -1,0 +1,18 @@
+# Secret scan settings. From the starter kit; lands in a project as kit-lint/gitleaks.toml, owned by the kit.
+# The commit hook and the merge checks pass --config kit-lint/gitleaks.toml, so a project's own
+# .gitleaks.toml is never read and cannot switch the scan off for a file.
+# It uses all of gitleaks' default rules, with one narrow allowance below.
+
+[extend]
+useDefault = true
+
+# The kit's manifest lists each kit file with its sha256 fingerprint (64 hex characters). A file name
+# with "token" in it, next to that fingerprint, looks like an API key to the generic rule.
+# Allowed only when all four match: that rule, that file, that line shape, and that secret shape.
+[[allowlists]]
+description = "kit manifest fingerprint lines"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^scripts/kit\.manifest\.json$''']
+regexTarget = "line"
+regexes = ['''^\s*"[A-Za-z0-9._/-]+": "[0-9a-f]{64}",?\s*$''']
