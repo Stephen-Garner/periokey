@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the PerioKey windows may call.",
+  "windows": ["pill", "settings"],
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
+}

@@ -6,18 +6,20 @@ import {
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import type { Keystroke } from "./keymap.ts";
+import {
+  typeReplyLog,
+  typeReplyProblem,
+  type FocusStatus,
+  type Injector,
+} from "./focus.ts";
 
-export type FocusStatus = "match" | "empty" | "mismatch";
-
-export type Injector = {
-  name: string;
-  type(keys: Keystroke[], delayMs: number, windowMatch?: string): Promise<void>;
-  // why: returns a status, never a title; Eaglesoft titles hold patient names.
-  focusCheck(windowMatch: string): Promise<FocusStatus>;
-  watchHotkey(hotkey: string, onPress: () => void): boolean;
-  showStatus(status: string): void;
-  close(): void;
-};
+export {
+  focusProblem,
+  typeReplyLog,
+  typeReplyProblem,
+  type FocusStatus,
+  type Injector,
+} from "./focus.ts";
 
 const SENDKEYS_NAMED: Record<string, string> = {
   backspace: "{BACKSPACE}",
@@ -89,12 +91,6 @@ export function parseFocusReply(reply: string): FocusStatus {
   return "mismatch";
 }
 
-export function focusProblem(status: FocusStatus, windowMatch: string): string {
-  return status === "empty"
-    ? "Paused: no active window detected on this desktop (check you didn't start PerioKey from a sandboxed terminal)."
-    : `Paused: Eaglesoft Perio Exam window is not focused (looking for "${windowMatch}").`;
-}
-
 export function desktopFromLine(line: string): string | null {
   return line.startsWith("DESKTOP\t") ? line.slice("DESKTOP\t".length) : null;
 }
@@ -104,24 +100,8 @@ export function isolatedDesktopWarning(desktop: string): string | null {
   return `Running on isolated Windows desktop "${desktop}" (not "Default"). Keystrokes and the floating pill will not reach Eaglesoft. Start PerioKey by double-clicking start-periokey.bat on Windows.`;
 }
 
-// why: console lines carry only counts and helper error text, never titles or words.
-export function typeReplyLog(reply: string, total: number): string | null {
-  if (reply === "OK") return null;
-  const lost = /^LOST_FOCUS (\d+)$/.exec(reply);
-  if (lost) return `[live] typing stopped: LOST_FOCUS (${lost[1]}/${total})`;
-  return `[live] typing error: ${reply.replace(/^ERR /, "")}`;
-}
-
 export function statusCommand(status: string): string {
   return `P\t${status.replace(/[^\x20-\x7e]/g, "")}`;
-}
-
-export function typeReplyProblem(reply: string, total: number): string | null {
-  if (reply === "OK") return null;
-  const lost = /^LOST_FOCUS (\d+)$/.exec(reply);
-  if (lost)
-    return `Paused: the dental software lost focus after ${lost[1]} of ${total} keys. Check the chart.`;
-  return `Paused: typing failed (${reply.replace(/^ERR /, "")}). Check the chart.`;
 }
 
 function windowsInjector(onDesktop?: (name: string) => void): Injector {

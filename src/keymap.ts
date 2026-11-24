@@ -1,5 +1,3 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { Action } from "./parser.ts";
 
 export type Modifier = "ctrl" | "alt" | "shift";
@@ -40,6 +38,7 @@ export type Profile = {
   bleeding: string;
   undo: string;
   skip: string;
+  prev_tooth: string;
   inter_key_delay_ms: number;
   bleeding_steps_back_first: boolean;
 };
@@ -71,7 +70,7 @@ export function validateProfile(raw: unknown): Profile {
   if (!(SEPARATORS as readonly unknown[]).includes(p.after_each_depth)) {
     problems.push(`after_each_depth must be one of ${SEPARATORS.join(", ")}`);
   }
-  for (const field of ["bleeding", "undo", "skip"]) {
+  for (const field of ["bleeding", "undo", "skip", "prev_tooth"]) {
     if (!isKeyName(p[field]))
       problems.push(
         `${field} must be one character or one of ${NAMED_KEYS.join(", ")}`,
@@ -93,14 +92,10 @@ export function validateProfile(raw: unknown): Profile {
   return p as Profile;
 }
 
-export function loadProfiles(dir: string): Map<string, Profile> {
+export function profilesFrom(raws: unknown[]): Map<string, Profile> {
   const profiles = new Map<string, Profile>();
-  for (const file of readdirSync(dir).filter((name) =>
-    name.endsWith(".json"),
-  )) {
-    const profile = validateProfile(
-      JSON.parse(readFileSync(join(dir, file), "utf8")),
-    );
+  for (const raw of raws) {
+    const profile = validateProfile(raw);
     profiles.set(profile.name, profile);
   }
   return profiles;
@@ -151,6 +146,8 @@ export function encodeActions(
       keys.push(key(profile.undo));
     } else if (action.type === "skip") {
       keys.push(key(profile.skip));
+    } else if (action.type === "prev_tooth") {
+      keys.push(key(profile.prev_tooth));
     } else if (action.type === "set_tooth" || action.type === "goto_tooth") {
       // why: no profile has a checked tooth-jump key yet, so refuse the whole phrase.
       return null;

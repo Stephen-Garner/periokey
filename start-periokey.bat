@@ -18,9 +18,9 @@ if errorlevel 1 echo Offline or update skipped -- starting current version.
 for /f %%i in ('git rev-parse HEAD') do set AFTER=%%i
 if "%BEFORE%"=="%AFTER%" goto install
 git diff --name-only %BEFORE% %AFTER% | findstr /i "package.json" >nul
-if not errorlevel 1 call npm.cmd install --omit=dev
+if not errorlevel 1 call npm.cmd install --omit=dev --no-package-lock
 :install
-if not exist node_modules call npm.cmd install --omit=dev
+if not exist node_modules call npm.cmd install --omit=dev --no-package-lock
 start "" http://localhost:4317
 node src/server.ts
 if errorlevel 1 pause

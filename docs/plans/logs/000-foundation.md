@@ -17,3 +17,22 @@ Built the parser, profiles (Eaglesoft default), key encoder, Windows and macOS t
 | Real Eaglesoft, real speech key | not run (no Windows PC or keys here) |
 
 Proposed for `docs/change-checklist.md`: when `profiles/` changes, ask who checked the key in the real software.
+
+## 2026-11-24 builder: Tauri desktop app
+
+Turned PerioKey into a Tauri v2 Windows app. The pill window runs the TypeScript engine (`src/engine.ts`, moved out of `src/server.ts`) and the mic. Rust does only typing (SendInput, front window checked before every key), the PHI-free focus check (MATCH, EMPTY, MISMATCH, with MDI child search), the tray, the global hotkey, settings storage, and updates.
+
+| Check | Result |
+|---|---|
+| `pnpm test` (through the slot) | 91 of 91 pass |
+| tsc, eslint, oxlint, prettier, switch-offs, ratchets | pass |
+| `cargo check` (macOS) | pass, no warnings |
+| `cargo check --target x86_64-pc-windows-msvc` | full app blocked: `ring` (updater TLS) needs Windows SDK headers; `src-tauri/src/keys.rs` alone compiles clean for Windows |
+| actionlint on the release workflow | pass |
+| Real Windows, real Eaglesoft | not run (no Windows PC here) |
+
+Not verified, needs an on-site check: `prev_tooth` = Left (it may jump a whole tooth); whether clicking the WebView2 pill takes focus despite WS_EX_NOACTIVATE (the focus check and LOST_FOCUS pause safely if it does); the WebView2 mic prompt.
+
+Head agent only: `.github/workflows/release.yml` is written in the worktree but not committed (builders may not change `.github/`). Stephen must add the repo secrets `TAURI_SIGNING_PRIVATE_KEY` (contents of `~/.tauri/periokey.key`) and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (empty).
+
+Duplicates to clean up later: `public/app.js` still has its own copies of the chart, cadence, and audio code now in `src/chart.ts`, `src/audio.ts`, and `src/desktop/settings.ts`.

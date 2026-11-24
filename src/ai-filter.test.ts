@@ -36,6 +36,10 @@ test("one number, chatter with numbers, corrections, and rejects go to the AI", 
     "3 2 3 instead",
     "tooth 16 should be 3 3 2",
     "let's pick up from tooth 5",
+    "oh undo that and put four",
+    "actually make that 4",
+    "redo that tooth as 3 3 2",
+    "redo previous tooth as 3 3 2",
   ])
     assert.equal(routes(text), true, text);
 });
@@ -258,4 +262,29 @@ test("a bad tooth, surface, or depth list throws out the whole reply", () => {
       { status: "ignore", reason: "invalid actions" },
       JSON.stringify(action),
     );
+});
+
+test("a whole-tooth redo comes back as prev_tooth, then the new depths", () => {
+  assert.deepEqual(
+    readNanoReply(
+      JSON.stringify({
+        intent: "actions",
+        actions: [
+          { type: "prev_tooth" },
+          { type: "depth", value: 3 },
+          { type: "depth", value: 3 },
+          { type: "depth", value: 2 },
+        ],
+      }),
+    ),
+    {
+      status: "accept",
+      actions: [
+        { type: "prev_tooth" },
+        { type: "depth", value: 3 },
+        { type: "depth", value: 3 },
+        { type: "depth", value: 2 },
+      ],
+    },
+  );
 });

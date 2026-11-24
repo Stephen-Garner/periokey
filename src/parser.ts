@@ -4,6 +4,7 @@ export type Action =
   | { type: "back" }
   | { type: "skip" }
   | { type: "pause" }
+  | { type: "prev_tooth" }
   | { type: "set_tooth"; tooth: number; surface: Surface; depths: number[] }
   | { type: "goto_tooth"; tooth: number; surface: Surface };
 

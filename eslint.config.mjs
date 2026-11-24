@@ -8,6 +8,8 @@ import { kitConfig } from "./kit-lint/eslint.base.mjs";
 // Custom project ESLint rules live in tooling/eslint/ (see docs/agents/procedures/lessons-to-rules.md).
 // A rule that Oxlint already runs is switched off after this list, so it never runs twice.
 // Loosening or removing a rule is a weakening: record it (docs/agents/core.md).
-const projectRules = [];
+const projectRules = [
+  { ignores: ["desktop/js/", "src-tauri/target/", "src-tauri/gen/"] },
+];
 
 export default kitConfig(import.meta.dirname, projectRules);

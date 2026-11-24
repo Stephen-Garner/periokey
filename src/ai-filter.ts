@@ -24,22 +24,34 @@ const CORRECTION_CUES = [
   "correction",
   "tooth",
   "pick",
+  "redo",
+  "put",
 ];
 const MAX_BACKS = 12;
 const MAX_TOOTH = 32;
 const SITES_PER_SURFACE = 6;
-const SIMPLE_TYPES = new Set(["bleeding", "back", "skip", "pause"]);
+const SIMPLE_TYPES = new Set([
+  "bleeding",
+  "back",
+  "skip",
+  "pause",
+  "prev_tooth",
+]);
 
 const SYSTEM_PROMPT = `You filter speech heard while a dental hygienist charts periodontal pocket depths by voice.
 You get JSON: {"recent": [the last few phrases, oldest first], "phrase": the new phrase}.
 Reply with strict JSON only, one of:
 {"intent":"ignore"} when the phrase is casual conversation, even if it holds numbers such as ages, months, times, prices, or "10 or 12".
 {"intent":"actions","actions":[...]} when the hygienist is charting or correcting the chart. Action items:
-{"type":"depth","value":N} with N a whole number from 1 to 15, {"type":"bleeding"}, {"type":"back"} (erase the last entry), {"type":"skip"}, {"type":"pause"}.
+{"type":"depth","value":N} with N a whole number from 1 to 15, {"type":"bleeding"}, {"type":"back"} (erase the last entry), {"type":"skip"}, {"type":"pause"}, {"type":"prev_tooth"} (move back to the start of the previous tooth).
 {"type":"set_tooth","tooth":16,"surface":"buccal","depths":[3,3,2]} to correct a named tooth (tooth 1 to 32, 1 to 6 depths).
 {"type":"goto_tooth","tooth":5,"surface":"buccal"} to resume at or jump to a named tooth, as in "let's pick up from tooth 5" or "go to tooth 4 lingual".
 Surface is "lingual" for lingual, palatal, tongue, or inside; "buccal" for buccal, facial, cheek, or outside; "buccal" when not said.
-For a correction, first send one back per entry to erase, then the new depths. Example: "actually scratch the last three, make it 3 3 2" gives three back actions, then depths 3, 3, 2.
+For a correction, first send one back per entry to erase, then the new depths. Every new number said in a correction must appear as a depth action; never drop it.
+Example: "actually scratch the last three, make it 3 3 2" gives three back actions, then depths 3, 3, 2.
+Example: "oh undo that and put four" gives back, then depth 4.
+Example: "actually make that 4" gives back, then depth 4.
+To redo a whole tooth, send prev_tooth, then the new depths. Example: "redo that tooth as 3 3 2" or "redo previous tooth as 3 3 2" gives prev_tooth, then depths 3, 3, 2.
 One phrase can hold both a tooth edit and a jump. Example: "actually tooth 16 lingual should be 3 3 2, now pick up from tooth 5" gives set_tooth 16 lingual [3,3,2], then goto_tooth 5 buccal.
 When unsure, reply {"intent":"ignore"}.`;
 

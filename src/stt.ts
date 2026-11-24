@@ -90,7 +90,7 @@ export function createDeepgramCollector(): {
 }
 
 function parseJson(data: unknown): Record<string, unknown> | null {
-  if (typeof data !== "string" && !Buffer.isBuffer(data)) return null;
+  if (typeof data !== "string") return null;
   try {
     return JSON.parse(String(data)) as Record<string, unknown>;
   } catch {
@@ -250,26 +250,57 @@ export function createOpenAiCollector(
   };
 }
 
+type SocketLike = {
+  readyState: number;
+  send(data: string): void;
+  close(): void;
+  addEventListener(
+    type: string,
+    listener: (event: { data?: unknown }) => void,
+  ): void;
+};
+export type OpenAiConnect = (url: string, apiKey: string) => SocketLike;
+
+export const headerConnect: OpenAiConnect = (url, apiKey) =>
+  new WsSocket(url, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  }) as unknown as SocketLike;
+
+// why: a browser WebSocket cannot send headers; OpenAI reads the key from this subprotocol instead.
+export const browserConnect: OpenAiConnect = (url, apiKey) =>
+  new WebSocket(url, [
+    "realtime",
+    `openai-insecure-api-key.${apiKey}`,
+  ]) as unknown as SocketLike;
+
+export function toBase64(bytes: Uint8Array): string {
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 0x8000)
+    text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(text);
+}
+
+const OPEN = 1;
+
 export function openAiProvider(
   apiKey: string,
   model: string,
   url = "wss://api.openai.com/v1/realtime?intent=transcription",
   silenceMs = 300,
+  connect: OpenAiConnect = headerConnect,
 ): SttProvider {
   return {
     name: "openai",
     start(handlers) {
-      const socket = new WsSocket(url, {
-        headers: { Authorization: `Bearer ${apiKey}` },
-      });
+      const socket = connect(url, apiKey);
       const collector = createOpenAiCollector(silenceMs);
       let closing = false;
-      socket.on("open", () => {
+      socket.addEventListener("open", () => {
         socket.send(JSON.stringify(openAiSessionUpdate(model, silenceMs)));
         handlers.onReady();
       });
-      socket.on("message", (data) => {
-        const message = parseJson(data);
+      socket.addEventListener("message", (event) => {
+        const message = parseJson(event.data);
         if (!message) return;
         if (message.type === "error") {
           handlers.onError(
@@ -280,22 +311,20 @@ export function openAiProvider(
         for (const phrase of collector.handle(message))
           handlers.onPhrase(phrase.text, phrase.timing);
       });
-      socket.on("error", () =>
+      socket.addEventListener("error", () =>
         handlers.onError("OpenAI connection failed. Check OPENAI_API_KEY."),
       );
-      socket.on("close", () => {
+      socket.addEventListener("close", () => {
         if (!closing) handlers.onError(CLOSED_MESSAGE);
       });
       return {
         sendAudio(pcm16) {
-          if (socket.readyState !== WsSocket.OPEN) return;
-          const audio = Buffer.from(
-            pcm16.buffer,
-            pcm16.byteOffset,
-            pcm16.byteLength,
-          ).toString("base64");
+          if (socket.readyState !== OPEN) return;
           socket.send(
-            JSON.stringify({ type: "input_audio_buffer.append", audio }),
+            JSON.stringify({
+              type: "input_audio_buffer.append",
+              audio: toBase64(pcm16),
+            }),
           );
         },
         close() {
