@@ -31,8 +31,11 @@ export function readConfig(env: Record<string, string | undefined>): Config {
     openAiKey,
     openAiModel: env.OPENAI_STT_MODEL?.trim() || "gpt-4o-transcribe",
     vadSilenceMs: Number(env.VAD_SILENCE_MS) || 300,
+    // why: the filter sends phrases to OpenAI, so it runs only when OpenAI is the chosen service.
     aiFilter:
-      openAiKey !== "" && filterSetting !== "off" && filterSetting !== "false",
+      provider === "openai" &&
+      filterSetting !== "off" &&
+      filterSetting !== "false",
     openAiFilterModel: env.OPENAI_FILTER_MODEL?.trim() || "gpt-5-nano",
     profile: env.PMS_PROFILE?.trim() || "eaglesoft",
     mode: env.PERIOKEY_MODE?.trim() === "live" ? "live" : "practice",

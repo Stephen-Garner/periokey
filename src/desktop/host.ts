@@ -39,8 +39,17 @@ const record = (value: unknown): Record<string, never> =>
     ? (value as Record<string, never>)
     : {};
 
+function parseOrEmpty(raw: string): unknown {
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+// why: a broken settings file must not stop the windows from opening; it reads as blank.
 export function settingsFrom(raw: string): Settings {
-  const parsed: unknown = raw ? JSON.parse(raw) : {};
+  const parsed = parseOrEmpty(raw);
   const p = (typeof parsed === "object" && parsed ? parsed : {}) as Partial<
     Record<keyof Settings, unknown>
   >;
@@ -58,6 +67,20 @@ export function profilesWith(edits: ProfileEdits): Map<string, Profile> {
       return { ...(base as object), ...edits[name], name };
     }),
   );
+}
+
+export function profilesSafe(edits: ProfileEdits): Map<string, Profile> {
+  try {
+    return profilesWith(edits);
+  } catch {
+    return profilesWith({});
+  }
+}
+
+// why: people paste "Bearer sk-..." or stray spaces; a key is only these characters.
+export function cleanKey(typed: string): string | null {
+  const key = typed.trim().replace(/^bearer\s+/i, "");
+  return /^[A-Za-z0-9_.-]+$/.test(key) ? key : null;
 }
 
 export const configOf = (settings: Settings): Config =>

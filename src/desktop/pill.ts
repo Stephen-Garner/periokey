@@ -12,7 +12,7 @@ import {
   configOf,
   desktopInjector,
   loadSettings,
-  profilesWith,
+  profilesSafe,
   tauri,
   type Settings,
 } from "./host.ts";
@@ -44,7 +44,9 @@ let sideNote = "";
 let audio: AudioContext | null = null;
 let mic: { stream: MediaStream; source: MediaStreamAudioSourceNode } | null =
   null;
-let capture: AudioWorkletNode | null = null;
+let capture: Promise<AudioWorkletNode> | null = null;
+let micStarting = false;
+let micToken = 0;
 let level = 0;
 let pending: Float32Array[] = [];
 let pendingLength = 0;
@@ -54,21 +56,16 @@ const dots = Array.from({ length: COLS * ROWS }, () =>
 );
 el("eq").replaceChildren(...dots);
 
-function profilesSafe(current: Settings) {
-  try {
-    return profilesWith(current.profileEdits);
-  } catch {
-    return profilesWith({});
-  }
-}
-
 const engine = createEngine({
   config: configOf(settings),
-  profiles: profilesSafe(settings),
+  profiles: profilesSafe(settings.profileEdits),
   makeInjector: desktopInjector,
   emit,
   openAiConnect: browserConnect,
-  micBlockedNote: "Allow microphone access for PerioKey, then press Start.",
+  micBlockedNote:
+    "Microphone blocked or missing. Open Settings, pick a mic, then press Start.",
+  noTargetNote:
+    'Set "window title contains" in Settings to use Live mode with this profile.',
 });
 
 function emit(message: EngineMessage): void {
@@ -95,7 +92,6 @@ function render(): void {
       ? "warn"
       : "";
   el("strip").textContent = view.recent.slice(-6).join(" ");
-  el("gear").dataset.update = String(sideNote.includes("ready"));
 }
 
 function drawEq(): void {
@@ -125,8 +121,15 @@ function earcon(kind: string): void {
   osc.stop(now + length);
 }
 
-async function captureNode(ctx: AudioContext): Promise<AudioWorkletNode> {
-  if (capture) return capture;
+function captureNode(ctx: AudioContext): Promise<AudioWorkletNode> {
+  capture ??= makeCaptureNode(ctx).catch((error: unknown) => {
+    capture = null;
+    throw error;
+  });
+  return capture;
+}
+
+async function makeCaptureNode(ctx: AudioContext): Promise<AudioWorkletNode> {
   await ctx.audioWorklet.addModule("js/mic-worklet.js");
   const node = new AudioWorkletNode(ctx, "mic-capture");
   const batch = Math.round((FRAMES_PER_SEND * ctx.sampleRate) / SAMPLE_RATE);
@@ -148,11 +151,11 @@ async function captureNode(ctx: AudioContext): Promise<AudioWorkletNode> {
   const mute = ctx.createGain();
   mute.gain.value = 0;
   node.connect(mute).connect(ctx.destination);
-  capture = node;
   return node;
 }
 
 function stopMic(): void {
+  micToken += 1;
   if (!mic) return;
   mic.source.disconnect();
   for (const track of mic.stream.getTracks()) track.stop();
@@ -161,19 +164,21 @@ function stopMic(): void {
   pendingLength = 0;
 }
 
-async function startMic(): Promise<void> {
+async function startMic(token: number): Promise<void> {
   audio ??= new AudioContext();
   await audio.resume();
   const node = await captureNode(audio);
+  // why: "ideal" falls back to the default mic when the saved one is unplugged.
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
-      deviceId: settings.mic ? { exact: settings.mic } : undefined,
+      deviceId: settings.mic ? { ideal: settings.mic } : undefined,
       channelCount: 1,
       echoCancellation: true,
       noiseSuppression: true,
     },
   });
-  if (!engine.isListening()) {
+  // why: Stop may have come while the mic was opening; a late stream is closed, never kept.
+  if (token !== micToken || !engine.isListening()) {
     for (const track of stream.getTracks()) track.stop();
     return;
   }
@@ -185,10 +190,17 @@ async function startMic(): Promise<void> {
 function syncMic(): void {
   const wanted = Boolean(view?.listening && view.provider !== "none");
   if (!wanted) return stopMic();
-  if (!mic)
-    startMic().catch(() => {
+  if (mic || micStarting) return;
+  micStarting = true;
+  const token = micToken;
+  startMic(token)
+    .catch(() => {
+      if (token !== micToken) return;
       stopMic();
       engine.handle({ type: "micBlocked" });
+    })
+    .finally(() => {
+      micStarting = false;
     });
 }
 
@@ -223,7 +235,7 @@ void tauri.event.listen("engine-in", ({ payload }) => {
 void tauri.event.listen("settings-changed", async () => {
   settings = await loadSettings();
   stopMic();
-  engine.reconfigure(configOf(settings), profilesSafe(settings));
+  engine.reconfigure(configOf(settings), profilesSafe(settings.profileEdits));
   await applyHotkey();
 });
 void tauri.event.listen<string>("update-status", ({ payload }) => {

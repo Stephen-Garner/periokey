@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { focusFrom, profilesWith, settingsFrom } from "./host.ts";
+import {
+  cleanKey,
+  focusFrom,
+  profilesSafe,
+  profilesWith,
+  settingsFrom,
+} from "./host.ts";
 
 test("profile edits override the shipped keys but never the name", () => {
   const profiles = profilesWith({
@@ -23,4 +29,25 @@ test("focus replies map to statuses; anything unknown is treated as empty", () =
   assert.equal(focusFrom("MATCH"), "match");
   assert.equal(focusFrom("MISMATCH"), "mismatch");
   assert.equal(focusFrom("ERR boom"), "empty");
+});
+
+test("a corrupt settings file falls back to defaults instead of crashing", () => {
+  assert.deepEqual(settingsFrom("{not json"), {
+    env: {},
+    mic: "",
+    profileEdits: {},
+  });
+});
+
+test("a bad saved profile edit falls back to the shipped profiles", () => {
+  const profiles = profilesSafe({ eaglesoft: { skip: "nope" } });
+  assert.equal(profiles.get("eaglesoft")?.skip, "right");
+});
+
+test("pasted keys lose a Bearer prefix; keys with spaces or symbols are refused", () => {
+  assert.equal(cleanKey("Bearer sk-abc_1.2"), "sk-abc_1.2");
+  assert.equal(cleanKey("sk-abc"), "sk-abc");
+  assert.equal(cleanKey("sk abc"), null);
+  assert.equal(cleanKey("  sk-abc\n"), "sk-abc");
+  assert.equal(cleanKey('sk-a"bc'), null);
 });

@@ -2,17 +2,20 @@
 mod win {
     use crate::Key;
     use std::{thread, time::Duration};
-    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
-        VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+        GetAsyncKeyState, MapVirtualKeyW, SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD,
+        KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
+        VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RIGHT,
+        VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
     };
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumChildWindows, GetForegroundWindow, GetWindowLongPtrW, GetWindowTextW,
-        IsWindowVisible, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW,
+        GetForegroundWindow, GetGUIThreadInfo, GetParent, GetWindowLongPtrW, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+        GUITHREADINFO, GWL_EXSTYLE, HWND_TOPMOST, MA_NOACTIVATE, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+        WM_MOUSEACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     };
 
     // why: titles hold patient names; they are compared here and never returned or logged.
@@ -22,31 +25,35 @@ mod win {
         len > 0 && String::from_utf16_lossy(&buf[..len as usize]).to_lowercase().contains(needle)
     }
 
-    struct Search<'a> {
-        needle: &'a str,
-        found: bool,
-    }
-
-    unsafe extern "system" fn visit(child: HWND, data: LPARAM) -> i32 {
-        let search = &mut *(data as *mut Search);
-        if IsWindowVisible(child) != 0 && title_has(child, search.needle) {
-            search.found = true;
-            return 0;
-        }
-        1
-    }
-
-    // why: Eaglesoft's Perio Exam can be a visible MDI child inside the outer Chart window.
-    fn matches(hwnd: HWND, needle: &str) -> bool {
+    // why: a Perio Exam left open behind another Eaglesoft window must not match, so only the
+    // control that has keyboard focus and the windows that contain it are checked.
+    fn matches(front: HWND, needle: &str) -> bool {
         if needle.is_empty() {
             return false;
         }
-        if title_has(hwnd, needle) {
-            return true;
+        let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        let thread = unsafe { GetWindowThreadProcessId(front, std::ptr::null_mut()) };
+        let mut hwnd = if unsafe { GetGUIThreadInfo(thread, &mut info) } != 0
+            && !info.hwndFocus.is_null()
+        {
+            info.hwndFocus
+        } else {
+            front
+        };
+        for _ in 0..32 {
+            if hwnd.is_null() {
+                return false;
+            }
+            if unsafe { IsIconic(hwnd) } == 0 && title_has(hwnd, needle) {
+                return true;
+            }
+            if hwnd == front {
+                return false;
+            }
+            hwnd = unsafe { GetParent(hwnd) };
         }
-        let mut search = Search { needle, found: false };
-        unsafe { EnumChildWindows(hwnd, Some(visit), &mut search as *mut Search as LPARAM) };
-        search.found
+        false
     }
 
     pub fn focus_check(window_match: &str) -> &'static str {
@@ -65,7 +72,8 @@ mod win {
         }
     }
 
-    fn input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+    fn input(vk: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+        let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
         INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
@@ -74,7 +82,7 @@ mod win {
         }
     }
 
-    fn virtual_key(key: &Key) -> Result<(u16, KEYBD_EVENT_FLAGS, Vec<u16>), String> {
+    fn virtual_key(key: &Key) -> Result<Vec<INPUT>, String> {
         let mut mods: Vec<u16> = key
             .mods
             .iter()
@@ -97,58 +105,81 @@ mod win {
             "space" => Some((VK_SPACE, 0)),
             _ => None,
         };
-        if let Some((vk, flags)) = named {
-            return Ok((vk, flags, mods));
-        }
-        let mut chars = key.key.encode_utf16();
-        let (Some(ch), None) = (chars.next(), chars.next()) else {
-            return Err("unknown key".into());
-        };
-        let scan = unsafe { VkKeyScanW(ch) };
-        if scan == -1 {
-            return Err("key not on this keyboard layout".into());
-        }
-        let shift = (scan >> 8) & 0xff;
-        for (bit, vk) in [(1, VK_SHIFT), (2, VK_CONTROL), (4, VK_MENU)] {
-            if shift & bit != 0 && !mods.contains(&vk) {
-                mods.push(vk);
+        let (vk, flags) = match named {
+            Some(found) => found,
+            None => {
+                let mut chars = key.key.encode_utf16();
+                let (Some(ch), None) = (chars.next(), chars.next()) else {
+                    return Err("unknown key".into());
+                };
+                let scan = unsafe { VkKeyScanW(ch) };
+                if scan == -1 {
+                    return Err("key not on this keyboard layout".into());
+                }
+                let shift = (scan >> 8) & 0xff;
+                for (bit, vk) in [(1, VK_SHIFT), (2, VK_CONTROL), (4, VK_MENU)] {
+                    if shift & bit != 0 && !mods.contains(&vk) {
+                        mods.push(vk);
+                    }
+                }
+                ((scan & 0xff) as u16, 0)
             }
-        }
-        Ok(((scan & 0xff) as u16, 0, mods))
+        };
+        let mut inputs: Vec<INPUT> = mods.iter().map(|m| input(*m, 0)).collect();
+        inputs.push(input(vk, flags));
+        inputs.push(input(vk, flags | KEYEVENTF_KEYUP));
+        inputs.extend(mods.iter().rev().map(|m| input(*m, KEYEVENTF_KEYUP)));
+        Ok(inputs)
     }
 
-    fn press(key: &Key) -> Result<(), String> {
-        let (vk, flags, mods) = virtual_key(key)?;
-        let mut inputs: Vec<INPUT> = mods.iter().map(|m| input(*m, 0, 0)).collect();
-        inputs.push(input(vk, 0, flags));
-        inputs.push(input(vk, 0, flags | KEYEVENTF_KEYUP));
-        inputs.extend(mods.iter().rev().map(|m| input(*m, 0, KEYEVENTF_KEYUP)));
-        let sent =
-            unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
-        if sent as usize == inputs.len() {
-            Ok(())
-        } else {
-            Err("Windows blocked the keystroke".into())
-        }
+    // why: a held Ctrl turns "3" into Ctrl+3, which Eaglesoft reads as a different command.
+    fn modifier_held() -> bool {
+        [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+            .iter()
+            .any(|vk| unsafe { GetAsyncKeyState(*vk as i32) } as u16 & 0x8000 != 0)
     }
 
     pub fn send_keys(keys: &[Key], delay_ms: u64, window_match: &str) -> String {
+        let presses = match keys.iter().map(virtual_key).collect::<Result<Vec<_>, _>>() {
+            Ok(presses) => presses,
+            Err(message) => return format!("ERR {message}"),
+        };
         let needle = window_match.to_lowercase();
         let target = unsafe { GetForegroundWindow() };
         if target.is_null() || !matches(target, &needle) {
             return "LOST_FOCUS 0".into();
         }
-        for (sent, key) in keys.iter().enumerate() {
+        for (sent, inputs) in presses.iter().enumerate() {
             let front = unsafe { GetForegroundWindow() };
             if front != target || !matches(front, &needle) {
                 return format!("LOST_FOCUS {sent}");
             }
-            if let Err(message) = press(key) {
-                return format!("ERR {message}");
+            if modifier_held() {
+                return format!("ERR Ctrl, Alt, Shift, or Windows key held down after {sent} keys");
+            }
+            let count = unsafe {
+                SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32)
+            };
+            if count as usize != inputs.len() {
+                return "ERR Windows blocked the keystroke".into();
             }
             thread::sleep(Duration::from_millis(delay_ms));
         }
         "OK".into()
+    }
+
+    unsafe extern "system" fn no_activate(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        _data: usize,
+    ) -> LRESULT {
+        if msg == WM_MOUSEACTIVATE {
+            return MA_NOACTIVATE as LRESULT;
+        }
+        DefSubclassProc(hwnd, msg, wparam, lparam)
     }
 
     pub fn show_without_focus(window: &tauri::WebviewWindow) {
@@ -161,14 +192,31 @@ mod win {
                 GWL_EXSTYLE,
                 style | (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize,
             );
+            SetWindowSubclass(hwnd, Some(no_activate), 1, 0);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
+    // why: the pill is shown with ShowWindow, so it is hidden the same way to keep one record of it.
+    pub fn hide(window: &tauri::WebviewWindow) {
+        if let Ok(handle) = window.hwnd() {
+            unsafe { ShowWindow(handle.0 as HWND, SW_HIDE) };
         }
     }
 }
 
 #[cfg(target_os = "windows")]
-pub use win::{focus_check, send_keys, show_without_focus};
+pub use win::{focus_check, hide, send_keys, show_without_focus};
 
 #[cfg(not(target_os = "windows"))]
 pub fn send_keys(_keys: &[crate::Key], _delay_ms: u64, _window_match: &str) -> String {
@@ -183,4 +231,9 @@ pub fn focus_check(_window_match: &str) -> &'static str {
 #[cfg(not(target_os = "windows"))]
 pub fn show_without_focus(window: &tauri::WebviewWindow) {
     let _ = window.show();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn hide(window: &tauri::WebviewWindow) {
+    let _ = window.hide();
 }

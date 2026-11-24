@@ -29,6 +29,7 @@ export type EngineDeps = {
   openAiConnect?: OpenAiConnect;
   filter?: typeof filterWithNano;
   micBlockedNote?: string;
+  noTargetNote?: string;
 };
 
 export type Engine = {
@@ -177,7 +178,8 @@ export function createEngine(deps: EngineDeps): Engine {
       return stopListening("Live mode needs Windows or macOS.");
     if (state.mode === "live" && !targetWindow()) {
       return stopListening(
-        "Set TARGET_WINDOW in .env (for example Notepad) to use live mode with this profile.",
+        deps.noTargetNote ??
+          "Set TARGET_WINDOW in .env (for example Notepad) to use live mode with this profile.",
       );
     }
     state.listening = true;
@@ -236,12 +238,12 @@ export function createEngine(deps: EngineDeps): Engine {
     const parsed = parsePhrase(text);
     const context = recentPhrases;
     recentPhrases = [...recentPhrases, text].slice(-3);
+    const id = sessionId;
     if (!config.aiFilter || !needsAiFilter(text, parsed)) {
-      const job = decide(text, parsed, false, timing);
+      const job = decide(text, parsed, false, id, timing);
       if (job) void typing(job);
       return;
     }
-    const id = sessionId;
     // why: the filter runs inside the typing queue, so phrases type in the order spoken.
     void typing(async () => {
       const result = await filter(
@@ -251,7 +253,7 @@ export function createEngine(deps: EngineDeps): Engine {
         context,
       );
       if (id !== sessionId) return;
-      await decide(text, result, true, timing)?.();
+      await decide(text, result, true, id, timing)?.();
     });
   }
 
@@ -259,6 +261,7 @@ export function createEngine(deps: EngineDeps): Engine {
     text: string,
     result: ParseResult,
     ai: boolean,
+    id: number,
     timing?: PhraseTiming,
   ): (() => Promise<void>) | null {
     // why: practice only, so live mode never echoes patient speech; kept in memory, never saved.
@@ -296,15 +299,28 @@ export function createEngine(deps: EngineDeps): Engine {
       );
       return null;
     }
+    // why: the previous-tooth key is unverified in real Eaglesoft, so live mode refuses it.
+    if (
+      mode === "live" &&
+      result.actions.some((a) => a.type === "prev_tooth")
+    ) {
+      flashRepeat(
+        "Redo a whole tooth is Practice-only until the previous-tooth key is checked in Eaglesoft.",
+      );
+      return null;
+    }
     // why: practice still fills the chart so cadence tests are not blocked; live refuses.
     if (keys === null && mode === "live") {
       flashRepeat("The 10 to 15 mm key is not set for this profile yet.");
       return null;
     }
     return async () => {
+      if (id !== sessionId) return;
       if (mode === "live") {
         if (!state.listening || !injector || !keys) return;
         const focus = await focusOnTarget();
+        // why: Stop may have been pressed while the focus check was running.
+        if (id !== sessionId || !state.listening) return;
         if (focus !== "match") return pauseForFocus(focus);
         await injector.type(keys, profile.inter_key_delay_ms, targetWindow());
       }

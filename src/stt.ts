@@ -42,6 +42,22 @@ export type SttHandlers = {
 export const CLOSED_MESSAGE =
   "Speech connection closed. Press F9 to reconnect.";
 export type SttSession = { sendAudio(pcm16: Uint8Array): void; close(): void };
+
+const DEAD_SESSION: SttSession = { sendAudio() {}, close() {} };
+
+// why: a bad key makes WebSocket throw an error quoting the key, so only a fixed message is sent.
+function openSafely<T>(
+  open: () => T,
+  handlers: SttHandlers,
+  message: string,
+): T | null {
+  try {
+    return open();
+  } catch {
+    setTimeout(() => handlers.onError(message), 0);
+    return null;
+  }
+}
 export type SttProvider = {
   name: "deepgram" | "openai";
   start(handlers: SttHandlers): SttSession;
@@ -105,7 +121,12 @@ export function deepgramProvider(
   return {
     name: "deepgram",
     start(handlers) {
-      const socket = new WebSocket(url, ["token", apiKey]);
+      const socket = openSafely(
+        () => new WebSocket(url, ["token", apiKey]),
+        handlers,
+        "The Deepgram key has characters a key cannot have. Paste it again.",
+      );
+      if (!socket) return DEAD_SESSION;
       const collector = createDeepgramCollector();
       let closing = false;
       socket.addEventListener("open", () => handlers.onReady());
@@ -292,7 +313,12 @@ export function openAiProvider(
   return {
     name: "openai",
     start(handlers) {
-      const socket = connect(url, apiKey);
+      const socket = openSafely(
+        () => connect(url, apiKey),
+        handlers,
+        "The OpenAI key has characters a key cannot have. Paste it again.",
+      );
+      if (!socket) return DEAD_SESSION;
       const collector = createOpenAiCollector(silenceMs);
       let closing = false;
       socket.addEventListener("open", () => {

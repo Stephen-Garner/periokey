@@ -2,8 +2,10 @@ import { TEN_TO_FIFTEEN_STYLES, type Profile } from "../keymap.ts";
 import type { Action } from "../parser.ts";
 import { SITES_PER_TOOTH, TEETH, applyToChart, emptyChart } from "../chart.ts";
 import {
+  cleanKey,
   configOf,
   loadSettings,
+  profilesSafe,
   profilesWith,
   saveSettings,
   tauri,
@@ -55,7 +57,7 @@ function fillForm(): void {
     el(id).placeholder = settings.env[name] ? "saved (hidden)" : "not set";
   }
   el("hotkey").value = config.hotkey;
-  const profiles = profilesWith(settings.profileEdits);
+  const profiles = profilesSafe(settings.profileEdits);
   const select = el<HTMLSelectElement>("profile");
   select.replaceChildren(
     ...[...profiles.values()].map((p) => new Option(p.label, p.name)),
@@ -67,11 +69,23 @@ function fillForm(): void {
 function fillKeys(profile: Profile | undefined): void {
   if (!profile) return;
   for (const field of keyFields())
-    field.value = String(profile[field.dataset.key as keyof Profile]);
+    field.value = String(profile[field.dataset.key as keyof Profile] ?? "");
+}
+
+// why: WebView2 hides mic names and ids until the mic is allowed once, so ask here and close it.
+async function allowMic(): Promise<void> {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  for (const track of stream.getTracks()) track.stop();
 }
 
 async function listMics(): Promise<void> {
-  const devices = await navigator.mediaDevices.enumerateDevices();
+  let devices = await navigator.mediaDevices.enumerateDevices();
+  if (devices.some((d) => d.kind === "audioinput" && !d.deviceId)) {
+    await allowMic().catch(() => {
+      el("saved").textContent = "Allow the microphone to choose one.";
+    });
+    devices = await navigator.mediaDevices.enumerateDevices();
+  }
   const inputs = devices.filter((d) => d.kind === "audioinput");
   const select = el<HTMLSelectElement>("mic");
   select.replaceChildren(
@@ -87,6 +101,7 @@ function edits(): Partial<Profile> {
   const out: Record<string, string | number> = {};
   for (const field of keyFields()) {
     const name = field.dataset.key ?? "";
+    if (field.value.trim() === "") continue;
     out[name] =
       name === "inter_key_delay_ms" ? Number(field.value) : field.value.trim();
   }
@@ -102,7 +117,14 @@ async function save(): Promise<void> {
     ["deepgramKey", "DEEPGRAM_API_KEY"],
   ] as const) {
     const typed = el(id).value.trim();
-    if (typed) env[name] = typed;
+    if (!typed) continue;
+    const key = cleanKey(typed);
+    if (!key) {
+      el("saved").textContent =
+        "That key has spaces or symbols a key cannot have. Paste it again.";
+      return;
+    }
+    env[name] = key;
   }
   env.PERIOKEY_HOTKEY = el("hotkey").value.trim() || "F9";
   const profile = el<HTMLSelectElement>("profile").value;
@@ -240,10 +262,21 @@ for (const button of document.querySelectorAll<HTMLElement>("[data-mode]"))
 el<HTMLSelectElement>("profile").addEventListener("change", (event) => {
   const name = (event.target as HTMLSelectElement).value;
   send({ type: "profile", name });
-  fillKeys(profilesWith(settings.profileEdits).get(name));
+  fillKeys(profilesSafe(settings.profileEdits).get(name));
 });
 el("save").addEventListener("click", () => {
   void save();
+});
+el("clearKeys").addEventListener("click", () => {
+  const env = { ...settings.env };
+  delete env.OPENAI_API_KEY;
+  delete env.DEEPGRAM_API_KEY;
+  settings = { ...settings, env };
+  void saveSettings(settings).then(async () => {
+    fillForm();
+    el("saved").textContent = "Saved keys cleared.";
+    await tauri.event.emit("settings-changed");
+  });
 });
 el<HTMLFormElement>("simulate").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -258,9 +291,24 @@ el("clear").addEventListener("click", () => {
   renderLog();
   send({ type: "clear" });
 });
+// why: the clipboard can outlive the app, so only counts and timings are copied, never words.
+function statLine(h: Heard): string {
+  const t = h.timing;
+  return [
+    h.verdict,
+    `${h.depths} depths`,
+    h.ai ? "nano" : "",
+    t.speechMs === undefined ? "" : `${t.speechMs}ms speech`,
+    t.gapMs === undefined ? "" : `${t.gapMs}ms pause`,
+    t.latencyMs === undefined ? "" : `${t.latencyMs}ms latency`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 el("copyLog").addEventListener("click", () => {
   void navigator.clipboard
-    .writeText([cadence(), ...log.map(logLine)].join("\n"))
+    .writeText([cadence(), ...log.map(statLine)].join("\n"))
     .catch(() => {
       el("note").textContent = "Could not copy the log.";
     });

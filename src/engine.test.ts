@@ -154,3 +154,80 @@ test("reconfigure swaps the speech key without a restart", () => {
     engine.close();
   }
 });
+
+test("live: a whole-tooth redo is refused with a buzz and types nothing", async () => {
+  const speech = fakeSpeech();
+  const sent: EngineMessage[] = [];
+  const typed: Keystroke[][] = [];
+  const engine = createEngine({
+    config: readConfig({
+      OPENAI_API_KEY: "k",
+      PERIOKEY_MODE: "live",
+      TARGET_WINDOW: "Perio Exam",
+    }),
+    profiles,
+    emit: (message) => sent.push(message),
+    makeInjector: () => fakeInjector(typed),
+    openAiConnect: speech.connect,
+    filter: async () => ({
+      status: "accept",
+      actions: [{ type: "prev_tooth" }, { type: "depth", value: 3 }],
+    }),
+  });
+  try {
+    engine.toggle();
+    await until(() => engine.isListening());
+    speech.say("redo that tooth as 3");
+    await until(() =>
+      sent.some((m) => m.type === "earcon" && m.kind === "buzz"),
+    );
+    assert.equal(typed.length, 0);
+    assert.equal(
+      sent.some((m) => m.type === "entry"),
+      false,
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test("live: Stop pressed during the focus check means nothing is typed", async () => {
+  const speech = fakeSpeech();
+  const typed: Keystroke[][] = [];
+  let hold = false;
+  let release: (() => void) | undefined;
+  const injector = fakeInjector(typed);
+  injector.focusCheck = () => {
+    // why: checks made while starting pass at once; only the one before typing is held.
+    if (!hold) return Promise.resolve("match");
+    return new Promise((resolve) => {
+      release = () => resolve("match");
+    });
+  };
+  const engine = createEngine({
+    config: readConfig({
+      OPENAI_API_KEY: "k",
+      PERIOKEY_MODE: "live",
+      TARGET_WINDOW: "Perio Exam",
+      AI_FILTER: "off",
+    }),
+    profiles,
+    emit() {},
+    makeInjector: () => injector,
+    openAiConnect: speech.connect,
+  });
+  try {
+    engine.toggle();
+    await until(() => engine.isListening());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    hold = true;
+    speech.say("three two three");
+    await until(() => release !== undefined);
+    engine.toggle();
+    release?.();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(typed.length, 0);
+  } finally {
+    engine.close();
+  }
+});

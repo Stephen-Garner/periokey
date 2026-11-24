@@ -38,7 +38,7 @@ export type Profile = {
   bleeding: string;
   undo: string;
   skip: string;
-  prev_tooth: string;
+  prev_tooth?: string;
   inter_key_delay_ms: number;
   bleeding_steps_back_first: boolean;
 };
@@ -71,6 +71,8 @@ export function validateProfile(raw: unknown): Profile {
     problems.push(`after_each_depth must be one of ${SEPARATORS.join(", ")}`);
   }
   for (const field of ["bleeding", "undo", "skip", "prev_tooth"]) {
+    // why: profiles made before prev_tooth existed stay valid; the key is just not set.
+    if (field === "prev_tooth" && p[field] === undefined) continue;
     if (!isKeyName(p[field]))
       problems.push(
         `${field} must be one character or one of ${NAMED_KEYS.join(", ")}`,
@@ -147,6 +149,7 @@ export function encodeActions(
     } else if (action.type === "skip") {
       keys.push(key(profile.skip));
     } else if (action.type === "prev_tooth") {
+      if (profile.prev_tooth === undefined) return null;
       keys.push(key(profile.prev_tooth));
     } else if (action.type === "set_tooth" || action.type === "goto_tooth") {
       // why: no profile has a checked tooth-jump key yet, so refuse the whole phrase.

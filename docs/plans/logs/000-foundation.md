@@ -36,3 +36,19 @@ Not verified, needs an on-site check: `prev_tooth` = Left (it may jump a whole t
 Head agent only: `.github/workflows/release.yml` is written in the worktree but not committed (builders may not change `.github/`). Stephen must add the repo secrets `TAURI_SIGNING_PRIVATE_KEY` (contents of `~/.tauri/periokey.key`) and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (empty).
 
 Duplicates to clean up later: `public/app.js` still has its own copies of the chart, cadence, and audio code now in `src/chart.ts`, `src/audio.ts`, and `src/desktop/settings.ts`.
+
+## 2026-11-24: review fixes for the Tauri app (builder)
+
+Astra graded the first build D and Neon graded it C-. Both accepted the 6 weakening reasons. Fixed:
+
+- Typing checks the control that has keyboard focus and the windows that hold it, not any child window, so a Perio Exam left open behind another Eaglesoft window does not match.
+- Every key is resolved before the first one is sent. Typing stops if Ctrl, Alt, Shift, or Windows is held. Keys carry scan codes.
+- The pill never takes focus: `focusable: false`, a WM_MOUSEACTIVATE handler, and a style refresh. It is shown and hidden the same way.
+- Stop during the focus check means nothing is typed (test proven to fail without the guard).
+- "Redo that tooth" is Practice-only, since the Left key is unverified. A profile may leave `prev_tooth` out.
+- The mic cannot start twice, and a late mic stream is closed. Settings asks for the mic first so names show.
+- Settings save atomically. A corrupt settings file or bad profile edit falls back to defaults. Pasted keys are cleaned or refused. A key that breaks the WebSocket gives a fixed message that never quotes the key. Saved keys can be cleared.
+- The AI filter runs only with an OpenAI key. A failed hotkey change keeps the old hotkey.
+- Copy stats copies counts and timings only, never words.
+
+Not fixed, for the head agent: keys reach both windows (needs a token design); the gap between the focus check and SendInput; another app with a matching title passes the check; Rust cannot stop mid-phrase; no Windows code signing; GitHub release secrets not added; WebView2 click and focus not yet tried on Windows; repeated code in public/app.js.

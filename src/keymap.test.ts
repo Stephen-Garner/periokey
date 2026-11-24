@@ -166,3 +166,10 @@ test("prev_tooth presses the profile's previous-tooth key, Left in Eaglesoft", (
     /prev_tooth must be/,
   );
 });
+
+test("a profile with no prev_tooth key stays valid, and a tooth redo then types nothing", () => {
+  const { prev_tooth: _unused, ...rest } = profile("generic");
+  const noRedo = validateProfile(rest);
+  assert.equal(noRedo.prev_tooth, undefined);
+  assert.equal(encodeActions([{ type: "prev_tooth" }], noRedo), null);
+});

@@ -1,6 +1,7 @@
 mod keys;
 
 use std::fs;
+use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
@@ -44,14 +45,35 @@ fn save_settings(app: AppHandle, json: String) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|_| "could not create the settings folder")?;
     }
-    fs::write(path, json).map_err(|_| "could not save settings".to_string())
+    // why: write a whole new file, then swap it in, so a crash mid-save never leaves half a file.
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, json).map_err(|_| "could not save settings")?;
+    fs::rename(&temp, &path).map_err(|_| "could not save settings".to_string())
 }
 
+#[derive(Default)]
+struct Hotkey(Mutex<Option<String>>);
+
 #[tauri::command]
-fn set_hotkey(app: AppHandle, hotkey: String) -> Result<(), String> {
+fn set_hotkey(app: AppHandle, state: tauri::State<Hotkey>, hotkey: String) -> Result<(), String> {
     let shortcuts = app.global_shortcut();
+    let mut current = state.0.lock().map_err(|_| "hotkey state is broken")?;
+    if current.as_deref() == Some(hotkey.as_str()) {
+        return Ok(());
+    }
     shortcuts.unregister_all().map_err(|e| e.to_string())?;
-    shortcuts.register(hotkey.as_str()).map_err(|e| e.to_string())
+    match shortcuts.register(hotkey.as_str()) {
+        Ok(()) => {
+            *current = Some(hotkey);
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(old) = current.as_deref() {
+                let _ = shortcuts.register(old);
+            }
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -66,7 +88,7 @@ fn show_settings(app: AppHandle) {
 #[tauri::command]
 fn hide_pill(app: AppHandle) {
     if let Some(window) = app.get_webview_window("pill") {
-        let _ = window.hide();
+        keys::hide(&window);
     }
 }
 
@@ -114,6 +136,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(Hotkey::default())
         .invoke_handler(tauri::generate_handler![
             send_keys,
             focus_check,
@@ -155,7 +178,12 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                match window.app_handle().get_webview_window(window.label()) {
+                    Some(webview) if window.label() == "pill" => keys::hide(&webview),
+                    _ => {
+                        let _ = window.hide();
+                    }
+                }
             }
         })
         .run(tauri::generate_context!())

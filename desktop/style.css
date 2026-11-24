@@ -186,9 +186,6 @@ body.pill {
   color: var(--ink);
   background: var(--wash);
 }
-.icon[data-update="true"] {
-  color: var(--accent);
-}
 
 /* settings */
 body.settings {
