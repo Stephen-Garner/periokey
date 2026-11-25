@@ -1,0 +1,20 @@
+diff --git a/README.md b/README.md
+index 98292ca..8439ec7 100644
+--- a/README.md
++++ b/README.md
+@@ -59,6 +59,7 @@ Eaglesoft is the default profile: `profiles/eaglesoft.json`. Each line is one se
+ | `skip` | `right` | Key for "skip" |
+ | `after_each_depth` | `none` | Extra key after each depth: none, tab, enter, or space |
+ | `inter_key_delay_ms` | `40` | Wait between keys, in milliseconds. Raise it if keys get lost |
++| `prev_tooth` | `left` | Key that jumps back one 3-site group, for "redo that tooth". Not checked yet (see step 5), so Live mode refuses it |
+ | `bleeding_steps_back_first` | `false` | If true, bleeding presses Left, then the bleeding key, then Right |
+ 
+ Checked on-site in Eaglesoft:
+@@ -73,6 +74,7 @@ Still to check by hand, once, in a **practice patient's** perio chart (about 30
+ 2. **10 mm or more.** Find how Eaglesoft takes 12 (Ctrl+2? a key and then 2?). Set `ten_to_fifteen` to the match: `ctrl_digit` (Ctrl+2), `minus_then_digit` (- then 2), `slash_then_digit` (/ then 2), `alt_equals_digit` (Alt+= then 2), `shift_one_digit` (Shift+1 then 2), or `two_digits` (1 then 2).
+ 3. **Bleeding.** Eaglesoft's button reads `Bleedin_g_`, with the `g` underlined. An underlined letter is a keyboard shortcut. After typing a depth, try `b`, then `g`, then `Alt+g`. Use the one that marks the site. For `g`, set `bleeding` to `g`. `Alt+g` needs a small code change first (a profile key cannot hold Alt yet), so tell the builder. If it marks the next site instead of the one just typed, set `bleeding_steps_back_first` to `true`.
+ 4. **Undo and skip.** Check that Backspace clears the last site and Right arrow skips one.
++5. **Redo a tooth.** `prev_tooth` is `left`, a guess: it should jump back one group of 3 sites. It is **not checked yet**, so "redo that tooth" works only in Practice. Press Left once after a full tooth and see where the cursor lands. If it lands at the start of that tooth's 3 sites, tell the builder so Live mode can use it.
+ The only other profile is `generic` (any notepad or grid, for testing). It types 10 to 15 as two digits.
+ 
+ ## Live mode on Windows
