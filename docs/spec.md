@@ -25,14 +25,14 @@ A full perio chart is 6 sites on up to 32 teeth: 192 numbers. Typing them alone 
 ## 5. Hard rules
 
 1. **All or nothing.** A phrase is typed whole or not at all. Why: a half-typed phrase moves the chart's cursor, and every later number lands on the wrong site.
-2. **No AI in the parser.** Fixed rules only, each with a unit test. Why: the same words must always give the same keys.
+2. **Fixed-rule parser; optional AI only for spoken corrections.** Clean charting phrases go through fixed rules only, each with a unit test, so the same words always give the same keys. When a hygienist speaks a messy correction (for example, "oh, actually make that 4"), an optional AI filter may run in Practice or Live mode, but its output is locked strictly to chart actions (depths 1 to 15, bleeding, back, skip, pause, or tooth actions), never free text.
 3. **Nothing is saved.** No audio or transcript goes to disk or a log. Why: it is patient health data.
 4. **Type only into the dental software.** In live mode, check the window in front before every phrase; pause if focus moves. Why: keys typed into the wrong window can do harm.
 5. **No real patient use before a BAA** with the speech provider. Why: HIPAA.
 
 ## 6. Not in scope
 
-Tooth-tracking state machines, databases, cloud servers, AI clean-up of transcripts, reading the screen (OCR), and user accounts.
+Tooth-tracking state machines, databases, cloud servers, free-text AI output, reading the screen (OCR), and user accounts.
 
 ## 7. How we know it works
 

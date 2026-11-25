@@ -54,8 +54,8 @@ If no one gave you a role, you are the head agent. Head agents and research work
 
 ## Project rules
 
-1. The hard rules in `docs/spec.md` section 5 are strict: all or nothing per phrase, no AI in the parser, nothing saved, type only into the dental software, no real patients before a BAA.
-2. Never log, print, or save audio, transcripts, or API keys. Keys live only in `.env`.
+1. The hard rules in `docs/spec.md` section 5 are strict: all or nothing per phrase, fixed-rule parser (optional AI filter only for spoken corrections, strictly chart actions), nothing saved, type only into the dental software, no real patients before a BAA.
+2. Never log, print, or save audio, transcripts, or API keys in plain text. Keys live only in `.env` (local server) or the OS credential store (Windows Credential Manager in the desktop app, never written to `settings.json` and never sent to the Settings window).
 3. A profile key that has not been checked in the real dental software stays marked unverified; never guess it as fact.
 4. The head agent never fixes review findings itself; a fresh builder does (`docs/project-rules.md`).
 
