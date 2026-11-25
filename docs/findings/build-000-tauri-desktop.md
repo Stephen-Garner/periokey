@@ -1,0 +1,5 @@
+- R2.1 Important: fixed: Rust now also checks the file name of the program that owns the front window; Live mode in the desktop app refuses to start until the office enters that name under "program file name" in Settings (keys.rs a_matching_title_in_another_program_does_not_pass, engine.test.ts refuses to start test)
+- R2.2 Important: fixed: each phrase carries a number; Stop calls stop_typing, and the Rust loop checks before every key and replies STOPPED with the count sent (keys.rs stop_during_typing test, engine.test.ts Stop while keys are being typed, host.test.ts Stop tells Rust)
+- R2.3 Important: fixed: mic start and stop moved to src/desktop/mic-sync.ts, which checks again each time an open request settles, so Start, Stop, Start ends with the mic on (mic-sync.test.ts)
+- R2.6 Nit: fixed: settingsFrom keeps only text values in env, so {"env":{"STT_PROVIDER":42}} no longer crashes startup (host.test.ts number where text belongs)
+- R2.7 Nit: later: the README note that prev_tooth Left is unverified is ready in docs/drafts/readme-prev-tooth.patch for the head agent, since builders may not edit README.md

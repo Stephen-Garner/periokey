@@ -41,4 +41,8 @@ Any new AI thread can open the repo, learn the project and its rules from the fi
 
 ## Decision log
 
+- 2026-11-24 (builder, Astra R2.1): the Eaglesoft profile ships with no `program_match`, because its program file name has not been checked on-site (project rule 3). The desktop app refuses Live mode until the office enters it in Settings. The local web page path (`win-helper.ps1`) is unchanged and still checks the title only.
+- 2026-11-24 (builder, Astra R2.2): Stop uses a rising phrase number in Rust (`fetch_max`), not an on/off flag, so a Stop that reaches Rust before its phrase starts still stops it, and the next phrase is never blocked.
+- 2026-11-24 (builder, Astra R2.3): the mic start and stop logic moved from `pill.ts` into `src/desktop/mic-sync.ts` so a test can drive it without a browser.
+
 ## Review
