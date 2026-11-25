@@ -1,10 +1,12 @@
 mod keys;
+mod secrets;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, Window, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_updater::UpdaterExt;
 
@@ -44,24 +46,56 @@ fn settings_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir.join("settings.json"))
 }
 
-#[tauri::command]
-fn load_settings(app: AppHandle) -> Result<String, String> {
-    let path = settings_path(&app)?;
-    Ok(fs::read_to_string(path).unwrap_or_default())
-}
-
-// why: the file holds API keys, so errors name the step, never the contents.
-#[tauri::command]
-fn save_settings(app: AppHandle, json: String) -> Result<(), String> {
-    serde_json::from_str::<serde_json::Value>(&json).map_err(|_| "settings are not valid JSON")?;
-    let path = settings_path(&app)?;
+// why: write a whole new file, then swap it in, so a crash mid-save never leaves half a file.
+fn write_settings(path: &std::path::Path, json: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|_| "could not create the settings folder")?;
     }
-    // why: write a whole new file, then swap it in, so a crash mid-save never leaves half a file.
     let temp = path.with_extension("json.tmp");
     fs::write(&temp, json).map_err(|_| "could not save settings")?;
-    fs::rename(&temp, &path).map_err(|_| "could not save settings".to_string())
+    fs::rename(&temp, path).map_err(|_| "could not save settings".to_string())
+}
+
+// why: an older build saved keys in settings.json; they are ignored and wiped from the file.
+#[tauri::command]
+fn load_settings(app: AppHandle) -> Result<String, String> {
+    let path = settings_path(&app)?;
+    let raw = fs::read_to_string(&path).unwrap_or_default();
+    match secrets::strip_keys(&raw) {
+        Ok((cleaned, true)) => {
+            write_settings(&path, &cleaned)?;
+            Ok(cleaned)
+        }
+        Ok((cleaned, false)) => Ok(cleaned),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+// why: errors name the step, never the contents; keys are stripped so they never reach disk.
+#[tauri::command]
+fn save_settings(app: AppHandle, json: String) -> Result<(), String> {
+    let (cleaned, _) = secrets::strip_keys(&json)?;
+    write_settings(&settings_path(&app)?, &cleaned)
+}
+
+#[tauri::command]
+fn read_api_keys(window: Window) -> Result<BTreeMap<String, String>, String> {
+    secrets::read_for(window.label(), &secrets::OsStore)
+}
+
+#[tauri::command]
+fn api_key_status() -> Result<secrets::KeyStatus, String> {
+    secrets::status(&secrets::OsStore)
+}
+
+#[tauri::command]
+fn set_api_key(window: Window, name: String, value: String) -> Result<(), String> {
+    secrets::set_for(window.label(), &secrets::OsStore, &name, &value)
+}
+
+#[tauri::command]
+fn clear_api_keys(window: Window) -> Result<(), String> {
+    secrets::clear_for(window.label(), &secrets::OsStore)
 }
 
 #[derive(Default)]
@@ -161,6 +195,10 @@ pub fn run() {
             focus_check,
             load_settings,
             save_settings,
+            read_api_keys,
+            api_key_status,
+            set_api_key,
+            clear_api_keys,
             set_hotkey,
             show_settings,
             hide_pill

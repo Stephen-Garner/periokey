@@ -34,6 +34,18 @@ export type Settings = {
 
 export const BASE_PROFILES: unknown[] = [eaglesoft, generic];
 
+// why: keys live in the OS credential store (decision 001), never in settings.json.
+export const KEY_NAMES = ["OPENAI_API_KEY", "DEEPGRAM_API_KEY"] as const;
+export type KeyName = (typeof KEY_NAMES)[number];
+export type Keys = Partial<Record<KeyName, string>>;
+export type KeyStatus = { openai: boolean; deepgram: boolean };
+
+const isKeyName = (name: string): boolean =>
+  (KEY_NAMES as readonly string[]).includes(name);
+
+const withoutKeyNames = (env: Record<string, string>): Record<string, string> =>
+  Object.fromEntries(Object.entries(env).filter(([name]) => !isKeyName(name)));
+
 const record = (value: unknown): Record<string, never> =>
   typeof value === "object" && value !== null
     ? (value as Record<string, never>)
@@ -62,7 +74,7 @@ export function settingsFrom(raw: string): Settings {
     Record<keyof Settings, unknown>
   >;
   return {
-    env: textOnly(p.env),
+    env: withoutKeyNames(textOnly(p.env)),
     mic: typeof p.mic === "string" ? p.mic : "",
     profileEdits: record(p.profileEdits),
   };
@@ -91,14 +103,51 @@ export function cleanKey(typed: string): string | null {
   return /^[A-Za-z0-9_.-]+$/.test(key) ? key : null;
 }
 
-export const configOf = (settings: Settings): Config =>
-  readConfig(settings.env);
+export const configOf = (settings: Settings, keys: Keys = {}): Config =>
+  readConfig({ ...withoutKeyNames(settings.env), ...keys });
 
-export const loadSettings = async (): Promise<Settings> =>
-  settingsFrom(await tauri.core.invoke<string>("load_settings"));
+type Invoke = Tauri["core"]["invoke"];
+const hostInvoke: Invoke = (command, args) => tauri.core.invoke(command, args);
 
-export const saveSettings = (settings: Settings): Promise<void> =>
-  tauri.core.invoke("save_settings", { json: JSON.stringify(settings) });
+export const loadSettings = async (
+  invoke: Invoke = hostInvoke,
+): Promise<Settings> => settingsFrom(await invoke<string>("load_settings"));
+
+export const saveSettings = (
+  settings: Settings,
+  invoke: Invoke = hostInvoke,
+): Promise<void> =>
+  invoke("save_settings", {
+    json: JSON.stringify({ ...settings, env: withoutKeyNames(settings.env) }),
+  });
+
+// why: Rust hands raw keys only to the pill window; any other window gets an error.
+export async function loadKeys(invoke: Invoke = hostInvoke): Promise<Keys> {
+  const reply = textOnly(await invoke<unknown>("read_api_keys"));
+  return Object.fromEntries(
+    Object.entries(reply).filter(([name]) => isKeyName(name)),
+  ) as Keys;
+}
+
+// why: Settings learns only saved or unset, so a key value can never reach its page.
+export async function loadKeyStatus(
+  invoke: Invoke = hostInvoke,
+): Promise<KeyStatus> {
+  const reply = record(await invoke<unknown>("api_key_status")) as Record<
+    string,
+    unknown
+  >;
+  return { openai: reply.openai === true, deepgram: reply.deepgram === true };
+}
+
+export const saveKey = (
+  name: KeyName,
+  value: string,
+  invoke: Invoke = hostInvoke,
+): Promise<void> => invoke("set_api_key", { name, value });
+
+export const clearKeys = (invoke: Invoke = hostInvoke): Promise<void> =>
+  invoke("clear_api_keys");
 
 export function focusFrom(reply: string): FocusStatus {
   if (reply === "MATCH") return "match";
@@ -106,12 +155,8 @@ export function focusFrom(reply: string): FocusStatus {
   return "empty";
 }
 
-type Invoke = Tauri["core"]["invoke"];
-
 // why: each phrase gets a number; Stop tells Rust to drop every phrase up to the newest one.
-export function desktopInjector(
-  invoke: Invoke = (command, args) => tauri.core.invoke(command, args),
-): Injector {
+export function desktopInjector(invoke: Invoke = hostInvoke): Injector {
   let token = 0;
   return {
     name: "desktop",

@@ -6,7 +6,7 @@ import { createEngine, type EngineMessage } from "./engine.ts";
 import type { Injector } from "./focus.ts";
 import type { Keystroke } from "./keymap.ts";
 import { loadProfiles } from "./load-profiles.ts";
-import type { ParseResult } from "./parser.ts";
+import type { Action, ParseResult } from "./parser.ts";
 import type { OpenAiConnect } from "./stt.ts";
 
 const profiles = loadProfiles(
@@ -332,3 +332,47 @@ test("live: Stop while keys are being typed tells the typer to stop", async () =
     engine.close();
   }
 });
+
+// why: Live mode may use the AI filter for corrections (decision 002), but tooth jumps stay Practice-only.
+for (const jump of [
+  { type: "goto_tooth", tooth: 5, surface: "buccal" },
+  { type: "set_tooth", tooth: 5, surface: "buccal", depths: [3, 2, 3] },
+] satisfies Action[]) {
+  test(`live: an AI reply with ${jump.type} is refused with a buzz and types nothing`, async () => {
+    const speech = fakeSpeech();
+    const sent: EngineMessage[] = [];
+    const typed: Keystroke[][] = [];
+    const asked: string[] = [];
+    const engine = createEngine({
+      config: readConfig({
+        OPENAI_API_KEY: "k",
+        PERIOKEY_MODE: "live",
+        TARGET_WINDOW: "Perio Exam",
+      }),
+      profiles,
+      emit: (message) => sent.push(message),
+      makeInjector: () => fakeInjector(typed),
+      openAiConnect: speech.connect,
+      filter: async (_key, _model, text) => {
+        asked.push(text);
+        return { status: "accept", actions: [jump] };
+      },
+    });
+    try {
+      engine.toggle();
+      await until(() => engine.isListening());
+      speech.say("actually go to tooth five");
+      await until(() =>
+        sent.some((m) => m.type === "earcon" && m.kind === "buzz"),
+      );
+      assert.deepEqual(asked, ["actually go to tooth five"]);
+      assert.equal(typed.length, 0);
+      assert.equal(
+        sent.some((m) => m.type === "entry"),
+        false,
+      );
+    } finally {
+      engine.close();
+    }
+  });
+}

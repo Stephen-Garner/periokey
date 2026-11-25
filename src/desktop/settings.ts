@@ -2,13 +2,18 @@ import { TEN_TO_FIFTEEN_STYLES, type Profile } from "../keymap.ts";
 import type { Action } from "../parser.ts";
 import { SITES_PER_TOOTH, TEETH, applyToChart, emptyChart } from "../chart.ts";
 import {
+  clearKeys,
   cleanKey,
   configOf,
+  loadKeyStatus,
   loadSettings,
+  saveKey,
   profilesSafe,
   profilesWith,
   saveSettings,
   tauri,
+  type KeyName,
+  type KeyStatus,
   type Settings,
 } from "./host.ts";
 
@@ -34,6 +39,8 @@ const el = <T extends HTMLElement = HTMLInputElement>(id: string): T => {
 };
 
 let settings: Settings = await loadSettings();
+const UNKNOWN: KeyStatus = { openai: false, deepgram: false };
+let saved: KeyStatus = await loadKeyStatus().catch(() => UNKNOWN);
 let view: View | null = null;
 let log: Heard[] = [];
 const chart = emptyChart();
@@ -48,13 +55,14 @@ function keyFields(): HTMLInputElement[] {
 
 function fillForm(): void {
   const config = configOf(settings);
-  el<HTMLSelectElement>("provider").value = config.provider ?? "openai";
-  for (const [id, name] of [
-    ["openaiKey", "OPENAI_API_KEY"],
-    ["deepgramKey", "DEEPGRAM_API_KEY"],
+  el<HTMLSelectElement>("provider").value =
+    settings.env.STT_PROVIDER === "deepgram" ? "deepgram" : "openai";
+  for (const [id, isSaved] of [
+    ["openaiKey", saved.openai],
+    ["deepgramKey", saved.deepgram],
   ] as const) {
     el(id).value = "";
-    el(id).placeholder = settings.env[name] ? "saved (hidden)" : "not set";
+    el(id).placeholder = isSaved ? "saved (hidden)" : "not set";
   }
   el("hotkey").value = config.hotkey;
   const profiles = profilesSafe(settings.profileEdits);
@@ -112,6 +120,7 @@ async function save(): Promise<void> {
   const env = { ...settings.env };
   const provider = el<HTMLSelectElement>("provider").value;
   env.STT_PROVIDER = provider;
+  const typedKeys: [KeyName, string][] = [];
   for (const [id, name] of [
     ["openaiKey", "OPENAI_API_KEY"],
     ["deepgramKey", "DEEPGRAM_API_KEY"],
@@ -124,7 +133,7 @@ async function save(): Promise<void> {
         "That key has spaces or symbols a key cannot have. Paste it again.";
       return;
     }
-    env[name] = key;
+    typedKeys.push([name, key]);
   }
   env.PERIOKEY_HOTKEY = el("hotkey").value.trim() || "F9";
   const profile = el<HTMLSelectElement>("profile").value;
@@ -140,8 +149,16 @@ async function save(): Promise<void> {
     el("saved").textContent = error instanceof Error ? error.message : "";
     return;
   }
+  try {
+    for (const [name, key] of typedKeys) await saveKey(name, key);
+  } catch {
+    el("saved").textContent =
+      "Could not save the key in the computer's password store. Try again.";
+    return;
+  }
   await saveSettings(next);
   settings = next;
+  saved = await loadKeyStatus().catch(() => UNKNOWN);
   fillForm();
   el("saved").textContent = "Saved.";
   await tauri.event.emit("settings-changed");
@@ -268,15 +285,16 @@ el("save").addEventListener("click", () => {
   void save();
 });
 el("clearKeys").addEventListener("click", () => {
-  const env = { ...settings.env };
-  delete env.OPENAI_API_KEY;
-  delete env.DEEPGRAM_API_KEY;
-  settings = { ...settings, env };
-  void saveSettings(settings).then(async () => {
-    fillForm();
-    el("saved").textContent = "Saved keys cleared.";
-    await tauri.event.emit("settings-changed");
-  });
+  void clearKeys()
+    .then(async () => {
+      saved = await loadKeyStatus().catch(() => UNKNOWN);
+      fillForm();
+      el("saved").textContent = "Saved keys cleared.";
+      await tauri.event.emit("settings-changed");
+    })
+    .catch(() => {
+      el("saved").textContent = "Could not clear the saved keys. Try again.";
+    });
 });
 el<HTMLFormElement>("simulate").addEventListener("submit", (event) => {
   event.preventDefault();

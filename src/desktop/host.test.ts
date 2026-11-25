@@ -1,10 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  clearKeys,
   cleanKey,
   configOf,
   desktopInjector,
   focusFrom,
+  loadKeyStatus,
+  loadKeys,
+  loadSettings,
+  saveKey,
+  saveSettings,
   profilesSafe,
   profilesWith,
   settingsFrom,
@@ -90,4 +96,87 @@ test("Stop tells Rust to drop the phrase being typed, and the pause says how man
   assert.deepEqual(calls.find(([command]) => command === "stop_typing")?.[1], {
     upTo: sent?.token,
   });
+});
+
+type Call = { command: string; args?: Record<string, unknown> };
+
+function fakeInvoke(replies: Record<string, unknown>): {
+  calls: Call[];
+  invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+} {
+  const calls: Call[] = [];
+  return {
+    calls,
+    invoke: async <T>(command: string, args?: Record<string, unknown>) => {
+      calls.push({ command, args });
+      return replies[command] as T;
+    },
+  };
+}
+
+test("saved settings never carry an API key, even if one slipped into env", async () => {
+  const fake = fakeInvoke({});
+  await saveSettings(
+    {
+      env: {
+        OPENAI_API_KEY: "sk-1",
+        DEEPGRAM_API_KEY: "dg-1",
+        PMS_PROFILE: "eaglesoft",
+      },
+      mic: "",
+      profileEdits: {},
+    },
+    fake.invoke,
+  );
+  const json = String(fake.calls[0]?.args?.json);
+  assert.equal(fake.calls[0]?.command, "save_settings");
+  assert.equal(json.includes("sk-1") || json.includes("dg-1"), false);
+  assert.equal(JSON.parse(json).env.PMS_PROFILE, "eaglesoft");
+});
+
+test("keys left in an old settings file are ignored", async () => {
+  const old = '{"env":{"OPENAI_API_KEY":"sk-old","STT_PROVIDER":"openai"}}';
+  const settings = await loadSettings(
+    fakeInvoke({ load_settings: old }).invoke,
+  );
+  assert.deepEqual(settings.env, { STT_PROVIDER: "openai" });
+  assert.equal(configOf(settings).openAiKey, "");
+});
+
+test("Settings sees only saved or unset, never a key value", async () => {
+  const status = await loadKeyStatus(
+    fakeInvoke({ api_key_status: { openai: "sk-leak", deepgram: true } })
+      .invoke,
+  );
+  assert.deepEqual(status, { openai: false, deepgram: true });
+  assert.equal(JSON.stringify(status).includes("sk-leak"), false);
+});
+
+test("the pill's keys come from the credential store and feed the config", async () => {
+  const keys = await loadKeys(
+    fakeInvoke({
+      read_api_keys: {
+        DEEPGRAM_API_KEY: "dg-1",
+        PATH: "/bin",
+        OPENAI_API_KEY: 7,
+      },
+    }).invoke,
+  );
+  assert.deepEqual(keys, { DEEPGRAM_API_KEY: "dg-1" });
+  const config = configOf(
+    settingsFrom('{"env":{"STT_PROVIDER":"deepgram"}}'),
+    keys,
+  );
+  assert.equal(config.provider, "deepgram");
+  assert.equal(config.deepgramKey, "dg-1");
+});
+
+test("setting and clearing keys go to the credential store commands", async () => {
+  const fake = fakeInvoke({});
+  await saveKey("OPENAI_API_KEY", "sk-2", fake.invoke);
+  await clearKeys(fake.invoke);
+  assert.deepEqual(fake.calls, [
+    { command: "set_api_key", args: { name: "OPENAI_API_KEY", value: "sk-2" } },
+    { command: "clear_api_keys", args: undefined },
+  ]);
 });

@@ -11,9 +11,11 @@ import {
 import {
   configOf,
   desktopInjector,
+  loadKeys,
   loadSettings,
   profilesSafe,
   tauri,
+  type Keys,
   type Settings,
 } from "./host.ts";
 import { createMicSync, type MicHandle } from "./mic-sync.ts";
@@ -40,6 +42,9 @@ const el = (id: string): HTMLElement => {
 };
 
 let settings: Settings = await loadSettings();
+// why: a broken credential store must not stop the pill; it runs as if no key is saved.
+const readKeys = (): Promise<Keys> => loadKeys().catch(() => ({}));
+let keys: Keys = await readKeys();
 let view: View | null = null;
 let sideNote = "";
 let audio: AudioContext | null = null;
@@ -60,7 +65,7 @@ const mic = createMicSync({
 });
 
 const engine = createEngine({
-  config: configOf(settings),
+  config: configOf(settings, keys),
   profiles: profilesSafe(settings.profileEdits),
   makeInjector: desktopInjector,
   emit,
@@ -218,8 +223,12 @@ void tauri.event.listen("engine-in", ({ payload }) => {
 });
 void tauri.event.listen("settings-changed", async () => {
   settings = await loadSettings();
+  keys = await readKeys();
   mic.stop();
-  engine.reconfigure(configOf(settings), profilesSafe(settings.profileEdits));
+  engine.reconfigure(
+    configOf(settings, keys),
+    profilesSafe(settings.profileEdits),
+  );
   await applyHotkey();
 });
 void tauri.event.listen<string>("update-status", ({ payload }) => {
