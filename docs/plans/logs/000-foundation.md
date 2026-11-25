@@ -90,3 +90,28 @@ Handoff:
 - `src/desktop/host.ts`: text-only env, injector numbers phrases and takes an `invoke` for tests. `src/desktop/mic-sync.ts` (new), `src/desktop/pill.ts` uses it. `desktop/settings.html`: "program file name" field, marked unverified.
 - Left: R2.4 and R2.5 (Stephen), R2.7 (head agent). Someone on-site must find Eaglesoft's program file name (Task Manager, Details tab) and enter it before Live mode works in the desktop app.
 - Trap: the web page path (`src/win-helper.ps1`) still matches the title only; worth the same program check later.
+
+## 2026-11-24 builder: Astra round 2 findings R2.4 and R2.5
+
+Merged `origin/main` into the PR branch first, to get decisions 001 and 002 and the updated spec.
+
+| Item | State | Proof |
+|---|---|---|
+| R2.4 keys in `settings.json` and sent to both windows | done | New `src-tauri/src/secrets.rs`: keys live in Windows Credential Manager (`CredReadW`/`CredWriteW`/`CredDeleteW`) or the macOS Keychain. `save_settings` and `load_settings` strip keys; an old file that holds keys is rewritten without them. `read_api_keys` answers the `pill` window only; `set_api_key` and `clear_api_keys` answer `settings` only; `api_key_status` gives two booleans. `settings-changed` still carries no payload. Errors never quote a key. Rust tests: `keys_are_stripped_from_settings_json_and_the_rest_is_kept`, `bad_settings_json_is_refused_without_quoting_it`, `only_the_pill_window_may_read_raw_keys`, `status_says_saved_or_unset_and_nothing_more`, `settings_sets_and_clears_keys_and_the_pill_cannot`, `bad_names_and_values_are_refused_without_quoting_the_value`. TS tests in `src/desktop/host.test.ts`: "saved settings never carry an API key", "keys left in an old settings file are ignored", "Settings sees only saved or unset", "the pill's keys come from the credential store", "setting and clearing keys go to the credential store commands" |
+| R2.5 AI corrections type in Live mode | done (intended, decision 002) | No product change. Live already refuses `prev_tooth` and tooth jumps from the AI. New tests in `src/engine.test.ts`: "live: an AI reply with goto_tooth / set_tooth is refused with a buzz and types nothing" (they check the tooth-jump message, since a second guard, no keys for tooth actions, would also buzz). The existing "live: a whole-tooth redo is refused" test already covers `prev_tooth` from the AI |
+
+CORE-9: I removed each guard one at a time and watched its test fail, then restored: pill-only read, settings-only set, known key names only, stripping `env` keys (Rust); stripping keys on save, ignoring keys in an old file, booleans-only status (TS); the Live tooth-jump refusal (engine, 2 tests fail).
+
+Checks: `node scripts/merge-pr.mjs --check --fast` all 11 pass. `node --test` on `src/engine.test.ts` (10), `src/desktop/host.test.ts` (14), `src/desktop/mic-sync.test.ts` (3): all pass. `cargo test` 11 pass; `cargo check` (macOS) clean, no warnings; `cargo fmt --check` clean. Windows: `secrets.rs` compiled clean for `x86_64-pc-windows-msvc` in a scratch crate (the full app is still blocked by `ring` needing Windows SDK headers). `pnpm build:desktop` builds. `node scripts/test-changes.mjs`: the same 6 weakenings, all with reasons; none new.
+
+Run: not run. The verify recipe covers only the web page, which this change does not touch. I did not start the desktop app, because it would write to the real Keychain on this Mac. Not yet tried on a real machine: saving, reading, and clearing a key in Windows Credential Manager and in the macOS Keychain.
+
+Handoff:
+- `src-tauri/src/secrets.rs` (new): key store trait, OS stores for Windows and macOS, window checks, settings stripping, tests with an in-memory store.
+- `src-tauri/src/lib.rs`: `load_settings` and `save_settings` strip keys; new commands `read_api_keys`, `api_key_status`, `set_api_key`, `clear_api_keys`.
+- `src-tauri/Cargo.toml`: `Win32_Security`, `Win32_Security_Credentials` features; `security-framework` on macOS.
+- `src/desktop/host.ts`: `KEY_NAMES`, `loadKeys`, `loadKeyStatus`, `saveKey`, `clearKeys`; `settingsFrom` and `saveSettings` drop key names; `configOf(settings, keys)`. Each takes an `invoke` for tests.
+- `src/desktop/pill.ts`: reads keys from Rust at start and on `settings-changed`. `src/desktop/settings.ts`: saves and clears keys through Rust, shows saved or unset only.
+- `src/engine.test.ts`: two R2.5 tests.
+- Left: an on-site check that keys save, survive a restart, and clear in Windows Credential Manager. A key saved by an older build in `settings.json` is wiped, not moved; the office must paste it again.
+- Trap: a macOS Keychain prompt may appear the first time an unsigned dev build reads a key.

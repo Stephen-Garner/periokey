@@ -44,5 +44,7 @@ Any new AI thread can open the repo, learn the project and its rules from the fi
 - 2026-11-24 (builder, Astra R2.1): the Eaglesoft profile ships with no `program_match`, because its program file name has not been checked on-site (project rule 3). The desktop app refuses Live mode until the office enters it in Settings. The local web page path (`win-helper.ps1`) is unchanged and still checks the title only.
 - 2026-11-24 (builder, Astra R2.2): Stop uses a rising phrase number in Rust (`fetch_max`), not an on/off flag, so a Stop that reaches Rust before its phrase starts still stops it, and the next phrase is never blocked.
 - 2026-11-24 (builder, Astra R2.3): the mic start and stop logic moved from `pill.ts` into `src/desktop/mic-sync.ts` so a test can drive it without a browser.
+- 2026-11-24 (builder, Astra R2.4): keys go to the OS credential store through Win32 `CredReadW`/`CredWriteW`/`CredDeleteW` (windows-sys, already a dependency) and the `security-framework` crate on macOS (already in Cargo.lock), not the `keyring` crate, to add no new dependency tree. Each key is a generic credential named `PerioKey/<KEY_NAME>`. Raw keys go to the `pill` window only; setting and clearing keys is `settings` only. `load_settings` rewrites an old file that still holds keys, so plain-text keys do not stay on disk.
+- 2026-11-24 (builder, Astra R2.4): the Settings speech service list now shows the saved `STT_PROVIDER` choice, since Settings no longer knows the keys and so cannot work out the fallback provider.
 
 ## Review

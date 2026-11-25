@@ -366,6 +366,8 @@ for (const jump of [
         sent.some((m) => m.type === "earcon" && m.kind === "buzz"),
       );
       assert.deepEqual(asked, ["actually go to tooth five"]);
+      const last = sent.filter((m) => m.type === "state").at(-1);
+      assert.match(String(last?.note), /tooth jumps are Practice-only/);
       assert.equal(typed.length, 0);
       assert.equal(
         sent.some((m) => m.type === "entry"),
