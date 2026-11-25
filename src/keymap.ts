@@ -33,6 +33,7 @@ export type Profile = {
   name: string;
   label: string;
   window_match: string;
+  program_match?: string;
   ten_to_fifteen: TenToFifteenStyle;
   after_each_depth: Separator;
   bleeding: string;
@@ -60,6 +61,8 @@ export function validateProfile(raw: unknown): Profile {
   if (typeof p.label !== "string") problems.push("label must be text");
   if (typeof p.window_match !== "string")
     problems.push("window_match must be text");
+  if (p.program_match !== undefined && typeof p.program_match !== "string")
+    problems.push("program_match must be text");
   if (
     !(TEN_TO_FIFTEEN_STYLES as readonly unknown[]).includes(p.ten_to_fifteen)
   ) {

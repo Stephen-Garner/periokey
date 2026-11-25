@@ -16,6 +16,7 @@ import {
   tauri,
   type Settings,
 } from "./host.ts";
+import { createMicSync, type MicHandle } from "./mic-sync.ts";
 
 const COLS = 13;
 const ROWS = 5;
@@ -42,11 +43,7 @@ let settings: Settings = await loadSettings();
 let view: View | null = null;
 let sideNote = "";
 let audio: AudioContext | null = null;
-let mic: { stream: MediaStream; source: MediaStreamAudioSourceNode } | null =
-  null;
 let capture: Promise<AudioWorkletNode> | null = null;
-let micStarting = false;
-let micToken = 0;
 let level = 0;
 let pending: Float32Array[] = [];
 let pendingLength = 0;
@@ -55,6 +52,12 @@ const dots = Array.from({ length: COLS * ROWS }, () =>
   document.createElement("i"),
 );
 el("eq").replaceChildren(...dots);
+
+const mic = createMicSync({
+  wanted: () => Boolean(view?.listening && view.provider !== "none"),
+  open: openMic,
+  onBlocked: () => engine.handle({ type: "micBlocked" }),
+});
 
 const engine = createEngine({
   config: configOf(settings),
@@ -66,13 +69,15 @@ const engine = createEngine({
     "Microphone blocked or missing. Open Settings, pick a mic, then press Start.",
   noTargetNote:
     'Set "window title contains" in Settings to use Live mode with this profile.',
+  noProgramNote:
+    'Live mode waits until the office checks the dental program. In Eaglesoft, find its file name (for example in Task Manager), then enter it under "program file name" in Settings.',
 });
 
 function emit(message: EngineMessage): void {
   if (message.type === "state") {
     view = message as unknown as View;
     render();
-    syncMic();
+    mic.sync();
   } else if (message.type === "earcon") earcon(String(message.kind));
   void tauri.event.emit("engine-out", message);
 }
@@ -154,20 +159,11 @@ async function makeCaptureNode(ctx: AudioContext): Promise<AudioWorkletNode> {
   return node;
 }
 
-function stopMic(): void {
-  micToken += 1;
-  if (!mic) return;
-  mic.source.disconnect();
-  for (const track of mic.stream.getTracks()) track.stop();
-  mic = null;
-  pending = [];
-  pendingLength = 0;
-}
-
-async function startMic(token: number): Promise<void> {
+async function openMic(): Promise<MicHandle> {
   audio ??= new AudioContext();
   await audio.resume();
-  const node = await captureNode(audio);
+  const ctx = audio;
+  const node = await captureNode(ctx);
   // why: "ideal" falls back to the default mic when the saved one is unplugged.
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -177,31 +173,19 @@ async function startMic(token: number): Promise<void> {
       noiseSuppression: true,
     },
   });
-  // why: Stop may have come while the mic was opening; a late stream is closed, never kept.
-  if (token !== micToken || !engine.isListening()) {
-    for (const track of stream.getTracks()) track.stop();
-    return;
-  }
-  const source = audio.createMediaStreamSource(stream);
-  source.connect(node);
-  mic = { stream, source };
-}
-
-function syncMic(): void {
-  const wanted = Boolean(view?.listening && view.provider !== "none");
-  if (!wanted) return stopMic();
-  if (mic || micStarting) return;
-  micStarting = true;
-  const token = micToken;
-  startMic(token)
-    .catch(() => {
-      if (token !== micToken) return;
-      stopMic();
-      engine.handle({ type: "micBlocked" });
-    })
-    .finally(() => {
-      micStarting = false;
-    });
+  let source: MediaStreamAudioSourceNode | null = null;
+  return {
+    start() {
+      source = ctx.createMediaStreamSource(stream);
+      source.connect(node);
+    },
+    close() {
+      source?.disconnect();
+      for (const track of stream.getTracks()) track.stop();
+      pending = [];
+      pendingLength = 0;
+    },
+  };
 }
 
 async function applyHotkey(): Promise<void> {
@@ -234,7 +218,7 @@ void tauri.event.listen("engine-in", ({ payload }) => {
 });
 void tauri.event.listen("settings-changed", async () => {
   settings = await loadSettings();
-  stopMic();
+  mic.stop();
   engine.reconfigure(configOf(settings), profilesSafe(settings.profileEdits));
   await applyHotkey();
 });

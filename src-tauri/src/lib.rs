@@ -15,15 +15,28 @@ pub struct Key {
 }
 
 #[tauri::command]
-async fn send_keys(keys: Vec<Key>, delay_ms: u64, window_match: String) -> String {
-    tauri::async_runtime::spawn_blocking(move || keys::send_keys(&keys, delay_ms, &window_match))
-        .await
-        .unwrap_or_else(|_| "ERR typing thread stopped".into())
+async fn send_keys(
+    keys: Vec<Key>,
+    delay_ms: u64,
+    window_match: String,
+    program_match: String,
+    token: u64,
+) -> String {
+    tauri::async_runtime::spawn_blocking(move || {
+        keys::send_keys(&keys, delay_ms, &window_match, &program_match, token)
+    })
+    .await
+    .unwrap_or_else(|_| "ERR typing thread stopped".into())
 }
 
 #[tauri::command]
-fn focus_check(window_match: String) -> &'static str {
-    keys::focus_check(&window_match)
+fn stop_typing(up_to: u64) {
+    keys::stop_typing(up_to);
+}
+
+#[tauri::command]
+fn focus_check(window_match: String, program_match: String) -> &'static str {
+    keys::focus_check(&window_match, &program_match)
 }
 
 fn settings_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
@@ -114,7 +127,10 @@ async fn check_update(app: AppHandle, install: bool) {
                 Err(_) => status("Update failed to install. Try again later.".into()),
             }
         }
-        Ok(Some(update)) => status(format!("Update {} ready: tray, Check for Updates.", update.version)),
+        Ok(Some(update)) => status(format!(
+            "Update {} ready: tray, Check for Updates.",
+            update.version
+        )),
         Ok(None) if install => status("PerioKey is up to date.".into()),
         Ok(None) => {}
         Err(_) if install => status("Could not check for updates.".into()),
@@ -125,7 +141,9 @@ async fn check_update(app: AppHandle, install: bool) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| show_pill(app)))
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            show_pill(app)
+        }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _, event| {
@@ -139,6 +157,7 @@ pub fn run() {
         .manage(Hotkey::default())
         .invoke_handler(tauri::generate_handler![
             send_keys,
+            stop_typing,
             focus_check,
             load_settings,
             save_settings,
@@ -152,12 +171,20 @@ pub fn run() {
                 handle,
                 &[
                     &MenuItem::with_id(handle, "pill", "Show Pill", true, None::<&str>)?,
-                    &MenuItem::with_id(handle, "settings", "Settings & Practice", true, None::<&str>)?,
+                    &MenuItem::with_id(
+                        handle,
+                        "settings",
+                        "Settings & Practice",
+                        true,
+                        None::<&str>,
+                    )?,
                     &MenuItem::with_id(handle, "update", "Check for Updates", true, None::<&str>)?,
                     &MenuItem::with_id(handle, "quit", "Quit", true, None::<&str>)?,
                 ],
             )?;
-            let mut tray = TrayIconBuilder::with_id("main").tooltip("PerioKey").menu(&menu);
+            let mut tray = TrayIconBuilder::with_id("main")
+                .tooltip("PerioKey")
+                .menu(&menu);
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
             }

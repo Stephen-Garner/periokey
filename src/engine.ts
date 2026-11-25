@@ -30,6 +30,8 @@ export type EngineDeps = {
   filter?: typeof filterWithNano;
   micBlockedNote?: string;
   noTargetNote?: string;
+  // why: set by the desktop app, whose typing also checks the program that owns the window.
+  noProgramNote?: string;
 };
 
 export type Engine = {
@@ -129,6 +131,10 @@ export function createEngine(deps: EngineDeps): Engine {
     );
   }
 
+  function targetProgram(): string {
+    return profiles.get(state.profile)?.program_match?.trim() ?? "";
+  }
+
   function broadcastState(): void {
     const status = state.repeat
       ? "Repeat"
@@ -167,6 +173,7 @@ export function createEngine(deps: EngineDeps): Engine {
     state.connecting = false;
     state.note = note;
     sessionId += 1;
+    injector?.stop?.();
     recentPhrases = [];
     session?.close();
     session = null;
@@ -182,6 +189,9 @@ export function createEngine(deps: EngineDeps): Engine {
           "Set TARGET_WINDOW in .env (for example Notepad) to use live mode with this profile.",
       );
     }
+    // why: live typing waits until the office has checked which program owns the chart window.
+    if (state.mode === "live" && deps.noProgramNote && !targetProgram())
+      return stopListening(deps.noProgramNote);
     state.listening = true;
     state.note = provider
       ? ""
@@ -226,7 +236,9 @@ export function createEngine(deps: EngineDeps): Engine {
 
   async function focusOnTarget(): Promise<FocusStatus> {
     if (!injector) return "empty";
-    return injector.focusCheck(targetWindow()).catch(() => "empty" as const);
+    return injector
+      .focusCheck(targetWindow(), targetProgram())
+      .catch(() => "empty" as const);
   }
 
   function pauseForFocus(status: FocusStatus): void {
@@ -322,7 +334,12 @@ export function createEngine(deps: EngineDeps): Engine {
         // why: Stop may have been pressed while the focus check was running.
         if (id !== sessionId || !state.listening) return;
         if (focus !== "match") return pauseForFocus(focus);
-        await injector.type(keys, profile.inter_key_delay_ms, targetWindow());
+        await injector.type(
+          keys,
+          profile.inter_key_delay_ms,
+          targetWindow(),
+          targetProgram(),
+        );
       }
       state.recent = [...state.recent, ...result.actions.map(entryLabel)].slice(
         -9,

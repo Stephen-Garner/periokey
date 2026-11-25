@@ -39,6 +39,14 @@ const record = (value: unknown): Record<string, never> =>
     ? (value as Record<string, never>)
     : {};
 
+// why: a hand-edited file may hold {"STT_PROVIDER": 42}; reading it must not crash startup.
+const textOnly = (value: unknown): Record<string, string> =>
+  Object.fromEntries(
+    Object.entries(record(value) as Record<string, unknown>).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+
 function parseOrEmpty(raw: string): unknown {
   try {
     return raw ? JSON.parse(raw) : {};
@@ -54,7 +62,7 @@ export function settingsFrom(raw: string): Settings {
     Record<keyof Settings, unknown>
   >;
   return {
-    env: record(p.env),
+    env: textOnly(p.env),
     mic: typeof p.mic === "string" ? p.mic : "",
     profileEdits: record(p.profileEdits),
   };
@@ -98,24 +106,41 @@ export function focusFrom(reply: string): FocusStatus {
   return "empty";
 }
 
-export function desktopInjector(): Injector {
+type Invoke = Tauri["core"]["invoke"];
+
+// why: each phrase gets a number; Stop tells Rust to drop every phrase up to the newest one.
+export function desktopInjector(
+  invoke: Invoke = (command, args) => tauri.core.invoke(command, args),
+): Injector {
+  let token = 0;
   return {
     name: "desktop",
-    async type(keys: Keystroke[], delayMs: number, windowMatch = "") {
-      const reply = await tauri.core.invoke<string>("send_keys", {
+    async type(
+      keys: Keystroke[],
+      delayMs: number,
+      windowMatch = "",
+      programMatch = "",
+    ) {
+      token += 1;
+      const reply = await invoke<string>("send_keys", {
         keys,
         delayMs,
         windowMatch,
+        programMatch,
+        token,
       });
       const line = typeReplyLog(reply, keys.length);
       if (line) console.warn(line);
       const problem = typeReplyProblem(reply, keys.length);
       if (problem) throw new Error(problem);
     },
-    focusCheck: async (windowMatch) =>
+    focusCheck: async (windowMatch, programMatch = "") =>
       focusFrom(
-        await tauri.core.invoke<string>("focus_check", { windowMatch }),
+        await invoke<string>("focus_check", { windowMatch, programMatch }),
       ),
+    stop() {
+      void invoke("stop_typing", { upTo: token }).catch(() => {});
+    },
     watchHotkey: () => false,
     showStatus: () => {},
     close: () => {},

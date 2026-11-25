@@ -231,3 +231,104 @@ test("live: Stop pressed during the focus check means nothing is typed", async (
     engine.close();
   }
 });
+
+test("desktop live: refuses to start until the office sets the program file name", () => {
+  const sent: EngineMessage[] = [];
+  const engine = createEngine({
+    config: readConfig({
+      PERIOKEY_MODE: "live",
+      TARGET_WINDOW: "Perio Exam",
+    }),
+    profiles,
+    emit: (message) => sent.push(message),
+    makeInjector: () => fakeInjector([]),
+    noProgramNote: "check the program first",
+  });
+  try {
+    engine.toggle();
+    assert.equal(engine.isListening(), false);
+    const last = sent.filter((m) => m.type === "state").at(-1);
+    assert.equal(last?.note, "check the program first");
+  } finally {
+    engine.close();
+  }
+});
+
+test("desktop live: the program file name goes with every focus check and typed phrase", async () => {
+  const speech = fakeSpeech();
+  const typed: Keystroke[][] = [];
+  const programs: (string | undefined)[] = [];
+  const injector = fakeInjector(typed);
+  injector.focusCheck = async (_window, program) => {
+    programs.push(program);
+    return "match";
+  };
+  injector.type = async (keys, _delay, _window, program) => {
+    programs.push(program);
+    typed.push(keys);
+  };
+  const checked = new Map(profiles);
+  const eaglesoft = profiles.get("eaglesoft");
+  assert.ok(eaglesoft);
+  checked.set("eaglesoft", { ...eaglesoft, program_match: "Eaglesoft.exe" });
+  const engine = createEngine({
+    config: readConfig({
+      OPENAI_API_KEY: "k",
+      PERIOKEY_MODE: "live",
+      TARGET_WINDOW: "Perio Exam",
+      AI_FILTER: "off",
+    }),
+    profiles: checked,
+    emit() {},
+    makeInjector: () => injector,
+    openAiConnect: speech.connect,
+    noProgramNote: "check the program first",
+  });
+  try {
+    engine.toggle();
+    await until(() => engine.isListening());
+    speech.say("three two three");
+    await until(() => typed.length === 1);
+    assert.ok(programs.length >= 2);
+    assert.ok(programs.every((program) => program === "Eaglesoft.exe"));
+  } finally {
+    engine.close();
+  }
+});
+
+test("live: Stop while keys are being typed tells the typer to stop", async () => {
+  const speech = fakeSpeech();
+  let stops = 0;
+  let typing = false;
+  const injector = fakeInjector([]);
+  injector.type = () => {
+    typing = true;
+    return new Promise(() => {});
+  };
+  injector.stop = () => {
+    stops += 1;
+  };
+  const engine = createEngine({
+    config: readConfig({
+      OPENAI_API_KEY: "k",
+      PERIOKEY_MODE: "live",
+      TARGET_WINDOW: "Perio Exam",
+      AI_FILTER: "off",
+    }),
+    profiles,
+    emit() {},
+    makeInjector: () => injector,
+    openAiConnect: speech.connect,
+  });
+  try {
+    engine.toggle();
+    await until(() => engine.isListening());
+    speech.say("three two three");
+    await until(() => typing);
+    const before = stops;
+    engine.toggle();
+    assert.equal(stops, before + 1);
+  } finally {
+    engine.close();
+  }
+});
