@@ -1,5 +1,5 @@
 - eslint.config.mjs: it only tells ESLint to skip build output folders (desktop/js, src-tauri/target, src-tauri/gen), so no source file loses a lint rule.
-- src/ai-filter.test.ts: the added lines are new sample phrases ("oh undo that and put four", "actually make that 4") that make the filter tests stricter, and no assertion was removed.
+- src/ai-filter.test.ts: two tests were renamed and "10", "12", "okay ten" moved from the goes-to-the-AI list to the no-AI list, because decision 002 says clean phrases the fixed rules accept never call the AI (Astra R3.1); "three" was added, and every other phrase and assertion still runs.
 - src/engine.test.ts: a new test file; the 5 ms wait is a poll that fails if typing never ends, the 20 ms waits let a held focus check settle (the Stop test fails without its guard), and each test makes its own typed list.
 - src/keymap.test.ts: the only changed line moves the loadProfiles import to its new file, load-profiles.ts; every old assertion still runs and one new test was added.
 - src/stt.test.ts: the test server now also records the WebSocket subprotocol so a new test can check the browser sign-in path; no old assertion was changed.
