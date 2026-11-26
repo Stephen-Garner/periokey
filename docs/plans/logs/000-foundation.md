@@ -115,3 +115,29 @@ Handoff:
 - `src/engine.test.ts`: two R2.5 tests.
 - Left: an on-site check that keys save, survive a restart, and clear in Windows Credential Manager. A key saved by an older build in `settings.json` is wiped, not moved; the office must paste it again.
 - Trap: a macOS Keychain prompt may appear the first time an unsigned dev build reads a key.
+
+## 2026-11-25 builder: Astra round 3 findings R3.1 to R3.4
+
+Astra round 3 (head 6784691) found 4 Important problems: R3.1 a clean lone depth ("three", "10") still called the AI filter, against decision 002; R3.2 keys in an old `settings.json` were wiped, not moved; R3.3 if audio setup failed after the mic opened, the mic stayed on and the open retried in a loop; R3.4 a late "stopped after 0" reply from a phrase typed before Stop paused the new session after Stop then Start.
+
+| Item | State | Proof |
+|---|---|---|
+| R3.1 clean lone depths skip the AI | done | `needsAiFilter` now sends an accepted, cue-free, known-word phrase to the AI only when it is one sound-alike ("to", "for"). Tests: `src/ai-filter.test.ts` "clean runs, lone depths, and lone commands take the instant path, with no AI call"; `src/engine.test.ts` "live: a clean single depth types it with fixed rules and never calls the AI" |
+| R3.2 old keys move before the file is rewritten | done | `secrets::move_old_keys` moves each old key into the store and keeps a key already stored. `load_settings_at` rewrites the file only when every move worked; `save_settings_at` moves old keys first and refuses the save if a move fails. Rust tests: `old_keys_move_to_the_store_and_a_saved_key_is_kept`, `an_old_key_moves_to_the_store_then_the_file_loses_it_and_a_second_launch_is_quiet`, `a_key_already_in_the_store_is_kept_over_the_old_file`, `a_failed_move_leaves_the_old_settings_file_untouched` |
+| R3.3 failed mic setup closes the mic | done | `handle.start()` failing closes the handle, reports once, and sets a latch that clears only when `wanted()` goes false. Test: `src/desktop/mic-sync.test.ts` "audio setup failing after the mic opens closes it, reports once, and waits for the next Start" |
+| R3.4 stale Stop reply | done | The typing job catches its own error and drops "stopped after 0" when its session is no longer the current one. New `stoppedCount` in `src/focus.ts`. Tests: `src/engine.test.ts` 'live: a late "stopped after 0" from before Stop leaves the new session listening' and 'live: a late "stopped after 2" from before Stop pauses the new session with the count' |
+
+CORE-9: I removed each fix one at a time and watched its tests fail, then restored: the AI routing (2 tests fail), the stale STOPPED 0 guard (1 fails), the mic close-on-setup-failure and the retry latch (1 fails each), load's move-before-rewrite (2 fail), keeping a stored key (2 fail), save's move-first (1 fails). The "stopped after 2" test pins behavior that was already right, so it passes either way.
+
+Checks: `node scripts/merge-pr.mjs --check --fast` all 11 pass. `node --test` on `src/engine.test.ts`, `src/ai-filter.test.ts`, `src/desktop/mic-sync.test.ts`, `src/desktop/host.test.ts`, `src/parser.test.ts`: 62 pass. `cargo test` 15 pass; `cargo check` (macOS) clean; `cargo fmt --check` clean. Windows: `secrets.rs` compiled for `x86_64-pc-windows-msvc` in a scratch crate (only "never used" warnings, since nothing calls it there). `keys.rs` was not changed and was not cross-checked: it needs `tauri`, which does not build for Windows on this Mac (`ring` needs Windows SDK headers). `pnpm build:desktop` builds. `node scripts/test-changes.mjs`: the same 6 weakenings; the `src/ai-filter.test.ts` and `src/engine.test.ts` reasons were updated for this round. `docs/findings/`: R3.1 to R3.4 answered, R2.4 and R2.5 shortened to 300 characters or fewer.
+
+Run: not run. The verify recipe covers only the web page, and I did not start the desktop app, since it would touch the real Keychain on this Mac. Not yet tried on a real machine: moving an old key from `settings.json` into Windows Credential Manager.
+
+Handoff:
+- `src/ai-filter.ts`: `needsAiFilter` keeps clean accepted phrases on fixed rules; `src/ai-filter.test.ts` lists moved.
+- `src/engine.ts`, `src/focus.ts`: the typing job ignores a stale "stopped after 0"; `stoppedCount` reads the count.
+- `src/desktop/mic-sync.ts`: close on setup failure, one report, latch until the next Start.
+- `src-tauri/src/secrets.rs`: `move_old_keys`. `src-tauri/src/lib.rs`: `load_settings_at` and `save_settings_at` (testable with any store), plus file tests.
+- `docs/findings/`, `docs/weakenings/`, the plan's Decision log: updated.
+- Left: on-site check that an old key moves into Windows Credential Manager on first launch.
+- Trap: the Rust file tests write under the system temp folder and remove their folder at the end.
