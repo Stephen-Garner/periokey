@@ -415,11 +415,11 @@ for (const sent of [0, 2]) {
   test(`live: a late "stopped after ${sent}" from before Stop ${sent === 0 ? "leaves the new session listening" : "pauses the new session with the count"}`, async () => {
     const speech = fakeSpeech();
     const states: EngineMessage[] = [];
-    let finish: ((error: Error) => void) | null = null;
+    const pending: { finish?: (error: Error) => void } = {};
     const injector = fakeInjector([]);
     injector.type = () =>
       new Promise((_resolve, reject) => {
-        finish = reject;
+        pending.finish = reject;
       });
     injector.stop = () => {};
     const engine = createEngine({
@@ -440,7 +440,7 @@ for (const sent of [0, 2]) {
       engine.toggle();
       await until(() => engine.isListening());
       speech.say("three two three");
-      await until(() => finish !== null);
+      await until(() => pending.finish !== undefined);
       engine.toggle();
       engine.toggle();
       assert.equal(engine.isListening(), true);
