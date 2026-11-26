@@ -444,7 +444,7 @@ for (const sent of [0, 2]) {
       engine.toggle();
       engine.toggle();
       assert.equal(engine.isListening(), true);
-      finish?.(
+      pending.finish?.(
         new Error(`Paused: stopped after ${sent} of 3 keys. Check the chart.`),
       );
       await new Promise((resolve) => setTimeout(resolve, 20));
