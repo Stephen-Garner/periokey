@@ -23,15 +23,25 @@ pub struct KeyStatus {
 
 /// Removes every API key from a settings file. Returns the cleaned JSON and whether a key was found.
 pub fn strip_keys(json: &str) -> Result<(String, bool), &'static str> {
+    strip(json, &KEY_NAMES)
+}
+
+/// Removes only the named keys; the cleaned JSON, or None when none of them was there.
+pub fn strip_named(json: &str, names: &[&str]) -> Result<Option<String>, &'static str> {
+    let (cleaned, found) = strip(json, names)?;
+    Ok(found.then_some(cleaned))
+}
+
+fn strip(json: &str, names: &[&str]) -> Result<(String, bool), &'static str> {
     let mut value: Value = serde_json::from_str(json).map_err(|_| "settings are not valid JSON")?;
     let mut found = false;
     if let Some(root) = value.as_object_mut() {
-        for name in KEY_NAMES {
-            found |= root.remove(name).is_some();
+        for name in names {
+            found |= root.remove(*name).is_some();
         }
         if let Some(env) = root.get_mut("env").and_then(Value::as_object_mut) {
-            for name in KEY_NAMES {
-                found |= env.remove(name).is_some();
+            for name in names {
+                found |= env.remove(*name).is_some();
             }
         }
     }
@@ -118,9 +128,9 @@ pub fn set_for(label: &str, store: &dyn Store, name: &str, value: &str) -> Resul
     store.set(name, &clean_value(value)?)
 }
 
-pub fn clear_for(label: &str, store: &dyn Store) -> Result<(), String> {
+pub fn clear_for(label: &str, store: &dyn Store, names: &[&str]) -> Result<(), String> {
     allow(label, "settings")?;
-    for name in KEY_NAMES {
+    for name in names {
         store.delete(name)?;
     }
     Ok(())
@@ -374,8 +384,8 @@ pub mod tests {
             Some("sk-1")
         );
         set_for("settings", &store, "DEEPGRAM_API_KEY", "dg-2").unwrap();
-        assert!(clear_for("pill", &store).is_err());
-        clear_for("settings", &store).unwrap();
+        assert!(clear_for("pill", &store, &KEY_NAMES).is_err());
+        clear_for("settings", &store, &KEY_NAMES).unwrap();
         assert_eq!(
             status(&store).unwrap(),
             KeyStatus {
@@ -383,7 +393,7 @@ pub mod tests {
                 deepgram: false
             }
         );
-        clear_for("settings", &store).unwrap();
+        clear_for("settings", &store, &KEY_NAMES).unwrap();
     }
 
     #[test]

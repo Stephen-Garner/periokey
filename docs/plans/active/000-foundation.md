@@ -50,5 +50,8 @@ Any new AI thread can open the repo, learn the project and its rules from the fi
 - 2026-11-25 (builder, Astra R3.2): an old key moves to the credential store trimmed but otherwise as saved (not through the paste cleaner), so a key the old build used is never refused and stuck. `save_settings` also moves old keys before it replaces a file that still holds them, and refuses the save if a move fails, so a Settings save cannot wipe an unmoved key.
 - 2026-11-25 (builder, Astra R3.3): after an open or setup failure, mic-sync waits until `wanted()` is false again (the next Stop/Start) before it opens the mic again, even if the engine has not paused yet.
 - 2026-11-25 (builder, Astra R3.4): a stale Stop reply is told apart by the phrase's session number; only "stopped after 0" from an older session is dropped. Any reply that sent keys still pauses, with the count, so the hygienist checks the chart.
+- 2026-11-25 (builder, Astra R4.1): `load_settings_at` keeps reading an unreadable file as empty settings, because it never writes after a failed read and an error there would stop the app from starting. Only the writing paths (save and clear) use the strict `read_existing`.
+- 2026-11-25 (builder, Astra R4.2): the `clear_api_keys` command name and its TypeScript caller are unchanged (builders may not edit TS this round). It calls `clear_api_keys_at` with both key names; the helper takes a list, so one key can be cleared and the other kept in settings.json.
+
 
 ## Review

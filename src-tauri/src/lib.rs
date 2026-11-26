@@ -73,6 +73,16 @@ fn load_settings_at(path: &std::path::Path, store: &dyn secrets::Store) -> Resul
     }
 }
 
+// why: only a missing file is empty; any other read error stops a write, so an unreadable
+// file that may hold old keys is never replaced. The error never quotes the file.
+fn read_existing(path: &std::path::Path) -> Result<String, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(_) => Err("could not read the saved settings file".into()),
+    }
+}
+
 // why: errors name the step, never the contents; keys are stripped so they never reach disk.
 // A file that still holds old keys is only replaced once they are in the credential store.
 fn save_settings_at(
@@ -81,11 +91,30 @@ fn save_settings_at(
     store: &dyn secrets::Store,
 ) -> Result<(), String> {
     let (cleaned, _) = secrets::strip_keys(json)?;
-    let old = fs::read_to_string(path).unwrap_or_default();
+    let old = read_existing(path)?;
     if matches!(secrets::strip_keys(&old), Ok((_, true))) {
         secrets::move_old_keys(&old, store)?;
     }
     write_settings(path, &cleaned)
+}
+
+// why: a key an older build left in settings.json would move back into the store on the next
+// launch, so clearing removes it from the store and from the file; only then is it cleared.
+fn clear_api_keys_at(
+    label: &str,
+    path: &std::path::Path,
+    store: &dyn secrets::Store,
+    names: &[&str],
+) -> Result<(), String> {
+    secrets::clear_for(label, store, names)?;
+    let old = read_existing(path)?;
+    if old.is_empty() {
+        return Ok(());
+    }
+    if let Some(cleaned) = secrets::strip_named(&old, names)? {
+        write_settings(path, &cleaned)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -114,8 +143,14 @@ fn set_api_key(window: Window, name: String, value: String) -> Result<(), String
 }
 
 #[tauri::command]
-fn clear_api_keys(window: Window) -> Result<(), String> {
-    secrets::clear_for(window.label(), &secrets::OsStore)
+fn clear_api_keys(app: AppHandle, window: Window) -> Result<(), String> {
+    let path = settings_path(&app)?;
+    clear_api_keys_at(
+        window.label(),
+        &path,
+        &secrets::OsStore,
+        &secrets::KEY_NAMES,
+    )
 }
 
 #[derive(Default)]
@@ -295,6 +330,35 @@ mod tests {
         }
     }
 
+    // why: fails to save until it is told to recover, like a locked credential store.
+    #[derive(Default)]
+    struct Flaky {
+        keys: Memory,
+        works: std::cell::Cell<bool>,
+    }
+
+    impl Store for Flaky {
+        fn get(&self, name: &str) -> Result<Option<String>, String> {
+            self.keys.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), String> {
+            if self.works.get() {
+                self.keys.set(name, value)
+            } else {
+                Err("could not save the key".into())
+            }
+        }
+        fn delete(&self, name: &str) -> Result<(), String> {
+            self.keys.delete(name)
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     const OLD: &str = r#"{"env":{"OPENAI_API_KEY":"sk-old","STT_PROVIDER":"openai"},"mic":"m1"}"#;
 
     fn temp_settings(name: &str) -> std::path::PathBuf {
@@ -346,6 +410,64 @@ mod tests {
         assert!(!loaded.contains("sk-old"));
         assert_eq!(fs::read_to_string(&path).unwrap(), OLD);
         assert!(save_settings_at(&path, r#"{"mic":"m2"}"#, &Broken).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), OLD);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_settings_file_stops_a_save_and_is_kept() {
+        let path = temp_settings("unreadable-save");
+        set_mode(&path, 0o000);
+        let err = save_settings_at(&path, r#"{"mic":"m2"}"#, &Memory::default()).unwrap_err();
+        set_mode(&path, 0o600);
+        assert!(!err.contains("sk-old") && !err.contains("m1"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), OLD);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_missing_settings_file_still_saves() {
+        let path = temp_settings("missing-save");
+        fs::remove_file(&path).unwrap();
+        save_settings_at(&path, r#"{"mic":"m2"}"#, &Memory::default()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"mic":"m2"}"#);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn clearing_a_key_also_removes_its_old_copy_so_a_later_launch_cannot_restore_it() {
+        let path = temp_settings("clear-old");
+        let both = r#"{"env":{"OPENAI_API_KEY":"sk-old","DEEPGRAM_API_KEY":"dg-old","STT_PROVIDER":"openai"},"mic":"m1"}"#;
+        fs::write(&path, both).unwrap();
+        let store = Flaky::default();
+        load_settings_at(&path, &store).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), both);
+        store.works.set(true);
+        assert!(clear_api_keys_at("pill", &path, &store, &["OPENAI_API_KEY"]).is_err());
+        clear_api_keys_at("settings", &path, &store, &["OPENAI_API_KEY"]).unwrap();
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("sk-old"));
+        assert!(on_disk.contains("dg-old") && on_disk.contains("m1") && on_disk.contains("openai"));
+        load_settings_at(&path, &store).unwrap();
+        assert_eq!(store.get("OPENAI_API_KEY").unwrap(), None);
+        assert_eq!(
+            store.get("DEEPGRAM_API_KEY").unwrap().as_deref(),
+            Some("dg-old")
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clearing_fails_when_the_old_copy_cannot_be_removed() {
+        let path = temp_settings("clear-unreadable");
+        let store = Memory::default();
+        store.set("OPENAI_API_KEY", "sk-new").unwrap();
+        set_mode(&path, 0o000);
+        let err = clear_api_keys_at("settings", &path, &store, &secrets::KEY_NAMES).unwrap_err();
+        set_mode(&path, 0o600);
+        assert!(!err.contains("sk-old") && !err.contains("sk-new"));
         assert_eq!(fs::read_to_string(&path).unwrap(), OLD);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

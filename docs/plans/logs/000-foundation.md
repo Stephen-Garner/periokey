@@ -141,3 +141,30 @@ Handoff:
 - `docs/findings/`, `docs/weakenings/`, the plan's Decision log: updated.
 - Left: on-site check that an old key moves into Windows Credential Manager on first launch.
 - Trap: the Rust file tests write under the system temp folder and remove their folder at the end.
+
+## 2026-11-25: review round 4 of the Tauri app (Astra, codex gpt-6.2-astra)
+
+Verdict: changes needed on 8a1faba. 2 important.
+
+1. Important, `src-tauri/src/lib.rs:84`: `save_settings_at` reads an unreadable `settings.json` as empty, so it skips moving old keys and then replaces the file, losing them. Treat only `NotFound` as absent; stop on any other read error.
+2. Important, `src-tauri/src/lib.rs:66`: clearing keys deletes them from the credential store only. A key still in an old `settings.json` moves back on the next launch. Remove it from the file too, and say done only when both work.
+
+## 2026-11-25 builder: Astra round 4 findings R4.1 and R4.2
+
+| Item | State | Proof |
+|---|---|---|
+| R4.1 unreadable settings file stops a save | done | New `read_existing` in `lib.rs`: a missing file reads as empty; any other read error returns "could not read the saved settings file" and nothing is written. `save_settings_at` uses it. Tests: `an_unreadable_settings_file_stops_a_save_and_is_kept` (file set to mode 000, save fails, file unchanged), `a_missing_settings_file_still_saves` |
+| R4.2 clearing removes the old copy too | done | New `clear_api_keys_at(label, path, store, names)`: checks the window, deletes each named key from the store, then removes only those keys from `settings.json` (rest kept), and returns `Ok` only after both. `secrets::clear_for` now takes the names; new `secrets::strip_named`. The `clear_api_keys` command calls it with both names. Tests: `clearing_a_key_also_removes_its_old_copy_so_a_later_launch_cannot_restore_it` (failing store keeps both old keys in the file, store recovers, OpenAI cleared, Deepgram and other settings kept, next load moves only Deepgram), `clearing_fails_when_the_old_copy_cannot_be_removed` |
+
+CORE-9: with `save_settings_at` reading through `unwrap_or_default` again, the unreadable-save test fails. With the file step of `clear_api_keys_at` removed, both clearing tests fail. Both fixes put back; all pass.
+
+Checks: `node scripts/merge-pr.mjs --check --fast` all 11 pass. `cargo test` 19 pass; `cargo check` (macOS) clean; `cargo fmt --check` clean. `node scripts/test-changes.mjs`: the same 6 weakenings as round 3, none new. Windows was not cross-compiled this round (no Windows-only code changed). The unreadable-file tests use Unix file modes, so they run on macOS and Linux only.
+
+Run: not run. The verify recipe covers only the web page, and starting the desktop app would touch the real Keychain on this Mac.
+
+Handoff:
+- `src-tauri/src/lib.rs`: `read_existing`, `save_settings_at` uses it, new `clear_api_keys_at`, `clear_api_keys` command now takes the app handle for the settings path; 4 new tests and a `Flaky` test store.
+- `src-tauri/src/secrets.rs`: `strip_keys` shares a `strip` helper with new `strip_named`; `clear_for` takes the key names. The task said lib.rs only; this small change avoids copying the key-stripping code.
+- Decision log: `load_settings_at` stays lenient on read errors (it never writes after a failed read); TS caller unchanged.
+- Left: none from round 4. Still open from round 3: on-site check of the key move into Windows Credential Manager.
+- Trap: the unreadable-file tests set mode 000 and set it back before reading; a test run as root would read the file anyway and fail.
