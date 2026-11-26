@@ -378,3 +378,86 @@ for (const jump of [
     }
   });
 }
+
+test("live: a clean single depth types it with fixed rules and never calls the AI", async () => {
+  const speech = fakeSpeech();
+  const typed: Keystroke[][] = [];
+  const asked: string[] = [];
+  const engine = createEngine({
+    config: readConfig({
+      OPENAI_API_KEY: "k",
+      PERIOKEY_MODE: "live",
+      TARGET_WINDOW: "Perio Exam",
+    }),
+    profiles,
+    emit() {},
+    makeInjector: () => fakeInjector(typed),
+    openAiConnect: speech.connect,
+    filter: async (_key, _model, text) => {
+      asked.push(text);
+      return { status: "ignore", reason: "conversation" };
+    },
+  });
+  try {
+    engine.toggle();
+    await until(() => engine.isListening());
+    speech.say("three");
+    await until(() => typed.length === 1);
+    assert.deepEqual(typed[0], [{ key: "3", mods: [] }]);
+    assert.deepEqual(asked, []);
+  } finally {
+    engine.close();
+  }
+});
+
+// why: Stop, then Start, while a phrase is typing; the old phrase's Stop reply arrives in the new session.
+for (const sent of [0, 2]) {
+  test(`live: a late "stopped after ${sent}" from before Stop ${sent === 0 ? "leaves the new session listening" : "pauses the new session with the count"}`, async () => {
+    const speech = fakeSpeech();
+    const states: EngineMessage[] = [];
+    let finish: ((error: Error) => void) | null = null;
+    const injector = fakeInjector([]);
+    injector.type = () =>
+      new Promise((_resolve, reject) => {
+        finish = reject;
+      });
+    injector.stop = () => {};
+    const engine = createEngine({
+      config: readConfig({
+        OPENAI_API_KEY: "k",
+        PERIOKEY_MODE: "live",
+        TARGET_WINDOW: "Perio Exam",
+        AI_FILTER: "off",
+      }),
+      profiles,
+      emit: (message) => {
+        if (message.type === "state") states.push(message);
+      },
+      makeInjector: () => injector,
+      openAiConnect: speech.connect,
+    });
+    try {
+      engine.toggle();
+      await until(() => engine.isListening());
+      speech.say("three two three");
+      await until(() => finish !== null);
+      engine.toggle();
+      engine.toggle();
+      assert.equal(engine.isListening(), true);
+      finish?.(
+        new Error(`Paused: stopped after ${sent} of 3 keys. Check the chart.`),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const note = String(states.at(-1)?.note);
+      if (sent === 0) {
+        assert.equal(engine.isListening(), true);
+        assert.doesNotMatch(note, /stopped after/);
+      } else {
+        assert.equal(engine.isListening(), false);
+        assert.match(note, /stopped after 2 of 3 keys/);
+      }
+    } finally {
+      engine.close();
+    }
+  });
+}

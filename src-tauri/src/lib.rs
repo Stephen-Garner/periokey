@@ -56,14 +56,16 @@ fn write_settings(path: &std::path::Path, json: &str) -> Result<(), String> {
     fs::rename(&temp, path).map_err(|_| "could not save settings".to_string())
 }
 
-// why: an older build saved keys in settings.json; they are ignored and wiped from the file.
-#[tauri::command]
-fn load_settings(app: AppHandle) -> Result<String, String> {
-    let path = settings_path(&app)?;
-    let raw = fs::read_to_string(&path).unwrap_or_default();
+// why: an older build saved keys in settings.json; each moves to the credential store first,
+// and the file is rewritten without keys only once every move worked, so no key is lost.
+fn load_settings_at(path: &std::path::Path, store: &dyn secrets::Store) -> Result<String, String> {
+    let raw = fs::read_to_string(path).unwrap_or_default();
     match secrets::strip_keys(&raw) {
         Ok((cleaned, true)) => {
-            write_settings(&path, &cleaned)?;
+            // why: a failed move leaves the old file as it was; the next launch tries again.
+            if secrets::move_old_keys(&raw, store).is_ok() {
+                write_settings(path, &cleaned)?;
+            }
             Ok(cleaned)
         }
         Ok((cleaned, false)) => Ok(cleaned),
@@ -72,10 +74,28 @@ fn load_settings(app: AppHandle) -> Result<String, String> {
 }
 
 // why: errors name the step, never the contents; keys are stripped so they never reach disk.
+// A file that still holds old keys is only replaced once they are in the credential store.
+fn save_settings_at(
+    path: &std::path::Path,
+    json: &str,
+    store: &dyn secrets::Store,
+) -> Result<(), String> {
+    let (cleaned, _) = secrets::strip_keys(json)?;
+    let old = fs::read_to_string(path).unwrap_or_default();
+    if matches!(secrets::strip_keys(&old), Ok((_, true))) {
+        secrets::move_old_keys(&old, store)?;
+    }
+    write_settings(path, &cleaned)
+}
+
+#[tauri::command]
+fn load_settings(app: AppHandle) -> Result<String, String> {
+    load_settings_at(&settings_path(&app)?, &secrets::OsStore)
+}
+
 #[tauri::command]
 fn save_settings(app: AppHandle, json: String) -> Result<(), String> {
-    let (cleaned, _) = secrets::strip_keys(&json)?;
-    write_settings(&settings_path(&app)?, &cleaned)
+    save_settings_at(&settings_path(&app)?, &json, &secrets::OsStore)
 }
 
 #[tauri::command]
@@ -253,4 +273,80 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("PerioKey could not start");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrets::tests::Memory;
+    use secrets::Store;
+
+    struct Broken;
+
+    impl Store for Broken {
+        fn get(&self, _: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("could not save the key".into())
+        }
+        fn delete(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    const OLD: &str = r#"{"env":{"OPENAI_API_KEY":"sk-old","STT_PROVIDER":"openai"},"mic":"m1"}"#;
+
+    fn temp_settings(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("periokey-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        fs::write(&path, OLD).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_old_key_moves_to_the_store_then_the_file_loses_it_and_a_second_launch_is_quiet() {
+        let path = temp_settings("move");
+        let store = Memory::default();
+        let first = load_settings_at(&path, &store).unwrap();
+        assert!(!first.contains("sk-old"));
+        assert_eq!(
+            store.get("OPENAI_API_KEY").unwrap().as_deref(),
+            Some("sk-old")
+        );
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("sk-old") && on_disk.contains("m1"));
+        assert_eq!(load_settings_at(&path, &store).unwrap(), first);
+        assert_eq!(
+            store.get("OPENAI_API_KEY").unwrap().as_deref(),
+            Some("sk-old")
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_key_already_in_the_store_is_kept_over_the_old_file() {
+        let path = temp_settings("keep");
+        let store = Memory::default();
+        store.set("OPENAI_API_KEY", "sk-new").unwrap();
+        load_settings_at(&path, &store).unwrap();
+        assert_eq!(
+            store.get("OPENAI_API_KEY").unwrap().as_deref(),
+            Some("sk-new")
+        );
+        assert!(!fs::read_to_string(&path).unwrap().contains("sk-old"));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_failed_move_leaves_the_old_settings_file_untouched() {
+        let path = temp_settings("fail");
+        let loaded = load_settings_at(&path, &Broken).unwrap();
+        assert!(!loaded.contains("sk-old"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), OLD);
+        assert!(save_settings_at(&path, r#"{"mic":"m2"}"#, &Broken).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), OLD);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 }

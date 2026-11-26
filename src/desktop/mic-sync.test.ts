@@ -101,3 +101,29 @@ test("a blocked mic reports once and does not retry on its own", async () => {
   assert.equal(fake.requests.length, 1);
   assert.equal(mic.isOpen(), false);
 });
+
+test("audio setup failing after the mic opens closes it, reports once, and waits for the next Start", async () => {
+  const fake = fakeMic();
+  let blocked = 0;
+  const mic = createMicSync({
+    wanted: () => true,
+    open: fake.open,
+    onBlocked() {
+      blocked += 1;
+    },
+  });
+  mic.sync();
+  const first = fake.requests[0];
+  assert.ok(first);
+  first.handle.start = () => {
+    throw new Error("audio setup failed");
+  };
+  first.give();
+  await settle();
+  mic.sync();
+  await settle();
+  assert.equal(first.handle.closed, true);
+  assert.equal(fake.requests.length, 1);
+  assert.equal(blocked, 1);
+  assert.equal(mic.isOpen(), false);
+});

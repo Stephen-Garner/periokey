@@ -65,9 +65,10 @@ export function needsAiFilter(text: string, parseResult: ParseResult): boolean {
   if (!hasCue && !hasPerioWord) return false;
   if (hasCue || parseResult.status !== "accept") return true;
   if (tokens.some((token) => token.kind === "unknown")) return true;
+  // why: decision 002, a clean phrase the fixed rules accept ("three", "10") never calls the AI; a lone sound-alike ("to", "for") may be chatter, so the AI still checks it.
   const depths = parseResult.actions.filter((a) => a.type === "depth").length;
-  const loneCommand = parseResult.actions.length === 1 && depths === 0;
-  return depths < 2 && !loneCommand;
+  const weak = tokens.some((t) => t.kind === "number" && !t.strong);
+  return depths === 1 && parseResult.actions.length === 1 && weak;
 }
 
 const isDepth = (value: unknown): value is number =>

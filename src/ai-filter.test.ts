@@ -9,8 +9,10 @@ import { filterWithNano, needsAiFilter, readNanoReply } from "./ai-filter.ts";
 const routes = (text: string): boolean =>
   needsAiFilter(text, parsePhrase(text));
 
-test("clean runs and lone commands take the instant path, with no AI call", () => {
+test("clean runs, lone depths, and lone commands take the instant path, with no AI call", () => {
   for (const text of ["3 2 3", "three two three bleeding", "4 4", "back"])
+    assert.equal(routes(text), false, text);
+  for (const text of ["three", "10", "12", "okay ten"])
     assert.equal(routes(text), false, text);
   for (const text of ["undo", "skip", "pause", "bleeding"])
     assert.equal(routes(text), false, text);
@@ -21,11 +23,8 @@ test("pure chatter with no numbers or chart words skips the AI too", () => {
   assert.equal(routes("open a little wider please"), false);
 });
 
-test("one number, chatter with numbers, corrections, and rejects go to the AI", () => {
+test("a lone sound-alike, chatter with numbers, corrections, and rejects go to the AI", () => {
   for (const text of [
-    "10",
-    "12",
-    "okay ten",
     "to",
     "for",
     "my son is two and my daughter is four and six",

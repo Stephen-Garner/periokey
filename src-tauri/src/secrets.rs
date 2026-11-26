@@ -39,6 +39,26 @@ pub fn strip_keys(json: &str) -> Result<(String, bool), &'static str> {
     Ok((cleaned, found))
 }
 
+/// Moves each key an older build left in settings.json into the store, before the file loses it.
+/// A key already in the store is newer and is kept. Any error means some key was not moved.
+pub fn move_old_keys(json: &str, store: &dyn Store) -> Result<(), String> {
+    let old: Value = serde_json::from_str(json).map_err(|_| "settings are not valid JSON")?;
+    for name in KEY_NAMES {
+        let found = [old.get("env").and_then(|env| env.get(name)), old.get(name)]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|value| !value.is_empty());
+        if let Some(value) = found {
+            if store.get(name)?.is_none() {
+                store.set(name, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // why: error text names the window and the step, never a key value.
 pub fn allow(label: &str, wanted: &str) -> Result<(), String> {
     if label == wanted {
@@ -252,13 +272,13 @@ impl Store for OsStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
 
     #[derive(Default)]
-    struct Memory(RefCell<HashMap<String, String>>);
+    pub struct Memory(pub RefCell<HashMap<String, String>>);
 
     impl Store for Memory {
         fn get(&self, name: &str) -> Result<Option<String>, String> {
@@ -289,6 +309,22 @@ mod tests {
         assert_eq!(value["mic"], "m1");
         let (_, again) = strip_keys(&cleaned).unwrap();
         assert!(!again);
+    }
+
+    #[test]
+    fn old_keys_move_to_the_store_and_a_saved_key_is_kept() {
+        let store = Memory::default();
+        store.set("OPENAI_API_KEY", "sk-new").unwrap();
+        let old = r#"{"env":{"OPENAI_API_KEY":"sk-old","DEEPGRAM_API_KEY":" dg-old "}}"#;
+        move_old_keys(old, &store).unwrap();
+        assert_eq!(
+            store.get("OPENAI_API_KEY").unwrap().as_deref(),
+            Some("sk-new")
+        );
+        assert_eq!(
+            store.get("DEEPGRAM_API_KEY").unwrap().as_deref(),
+            Some("dg-old")
+        );
     }
 
     #[test]

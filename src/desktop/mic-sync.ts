@@ -11,6 +11,8 @@ export function createMicSync(deps: {
   let mic: MicHandle | null = null;
   let opening = false;
   let token = 0;
+  // why: after a failure, wait for the next Start (wanted goes false, then true) before trying again.
+  let failed = false;
 
   function stop(): void {
     token += 1;
@@ -18,9 +20,18 @@ export function createMicSync(deps: {
     mic = null;
   }
 
+  function blocked(): void {
+    stop();
+    failed = true;
+    deps.onBlocked();
+  }
+
   function sync(): void {
-    if (!deps.wanted()) return stop();
-    if (mic || opening) return;
+    if (!deps.wanted()) {
+      failed = false;
+      return stop();
+    }
+    if (mic || opening || failed) return;
     opening = true;
     const mine = token;
     deps
@@ -29,13 +40,17 @@ export function createMicSync(deps: {
         (handle) => {
           // why: Stop may have come while the mic was opening; a late stream is closed, never kept.
           if (mine !== token || !deps.wanted()) return handle.close();
-          handle.start();
+          try {
+            handle.start();
+          } catch {
+            // why: audio setup failed after the mic opened; close it now so it is not left on.
+            handle.close();
+            return blocked();
+          }
           mic = handle;
         },
         () => {
-          if (mine !== token) return;
-          stop();
-          deps.onBlocked();
+          if (mine === token) blocked();
         },
       )
       .finally(() => {

@@ -6,7 +6,12 @@ import {
 } from "./parser.ts";
 import { filterWithNano, needsAiFilter } from "./ai-filter.ts";
 import { describeKey, encodeActions, type Profile } from "./keymap.ts";
-import { focusProblem, type FocusStatus, type Injector } from "./focus.ts";
+import {
+  focusProblem,
+  stoppedCount,
+  type FocusStatus,
+  type Injector,
+} from "./focus.ts";
 import {
   deepgramProvider,
   openAiProvider,
@@ -334,12 +339,18 @@ export function createEngine(deps: EngineDeps): Engine {
         // why: Stop may have been pressed while the focus check was running.
         if (id !== sessionId || !state.listening) return;
         if (focus !== "match") return pauseForFocus(focus);
-        await injector.type(
-          keys,
-          profile.inter_key_delay_ms,
-          targetWindow(),
-          targetProgram(),
-        );
+        try {
+          await injector.type(
+            keys,
+            profile.inter_key_delay_ms,
+            targetWindow(),
+            targetProgram(),
+          );
+        } catch (error) {
+          // why: a late "stopped after 0" from a phrase before Stop typed nothing, so it must not pause a new Start.
+          if (id !== sessionId && stoppedCount(error) === 0) return;
+          throw error;
+        }
       }
       state.recent = [...state.recent, ...result.actions.map(entryLabel)].slice(
         -9,

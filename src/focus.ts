@@ -45,3 +45,12 @@ export function typeReplyProblem(reply: string, total: number): string | null {
     return `Paused: stopped after ${stopped[1]} of ${total} keys. Check the chart.`;
   return `Paused: typing failed (${reply.replace(/^ERR /, "")}). Check the chart.`;
 }
+
+// why: reads the count back from typeReplyProblem's Stop message, so a stale Stop can be told apart.
+export function stoppedCount(error: unknown): number | null {
+  const found =
+    error instanceof Error
+      ? /^Paused: stopped after (\d+) of /.exec(error.message)
+      : null;
+  return found ? Number(found[1]) : null;
+}
