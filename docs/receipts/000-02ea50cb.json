@@ -1,0 +1,48 @@
+{
+  "task": "000",
+  "verdict": "approve",
+  "model": "gpt-6.2-astra",
+  "tool": "codex",
+  "at": "2026-11-26T04:16:20.275Z",
+  "session": "/Users/stephengarner/.codex/sessions/2026/11/25/rollout-2026-11-25T21-13-16-01a2160e-c4c8-7cc0-86ba-adee7d2508e3.jsonl",
+  "fingerprints": [],
+  "protectedTests": [
+    {
+      "file": "eslint.config.mjs",
+      "ruling": "allowed"
+    },
+    {
+      "file": "src/ai-filter.test.ts",
+      "ruling": "allowed"
+    },
+    {
+      "file": "src/engine.test.ts",
+      "ruling": "allowed"
+    },
+    {
+      "file": "src/keymap.test.ts",
+      "ruling": "allowed"
+    },
+    {
+      "file": "src/stt.test.ts",
+      "ruling": "allowed"
+    },
+    {
+      "file": "tsconfig.json",
+      "ruling": "allowed"
+    }
+  ],
+  "counts": {
+    "important": 0,
+    "nit": 1,
+    "preExisting": 0
+  },
+  "level": "deep",
+  "security": "clear",
+  "checklist": [
+    {
+      "id": "CL-1",
+      "answer": "does not apply"
+    }
+  ]
+}
