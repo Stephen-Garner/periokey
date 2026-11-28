@@ -1,0 +1,58 @@
+{
+  "task": "kit-5-3-2",
+  "verdict": "approve",
+  "model": "gpt-6.2-astra",
+  "tool": "codex",
+  "at": "2026-11-28T05:50:37.891Z",
+  "session": "/Users/stephengarner/.codex/sessions/2026/11/27/rollout-2026-11-27T22-49-56-01a220b3-fe54-7a62-8fc7-df497887e15a.jsonl",
+  "fingerprints": [
+    {
+      "fingerprint": "68e9227bd3d521ee6cde398f046b2f4a7c0cf50e",
+      "commit": "a1ac051247dd189d6fb88b549bf4939e83d89174"
+    }
+  ],
+  "protectedTests": [
+    {
+      "file": "scripts/check-plans.test.mjs",
+      "ruling": "allowed"
+    },
+    {
+      "file": "scripts/clean-worktrees.test.mjs",
+      "ruling": "allowed"
+    },
+    {
+      "file": "scripts/findings.test.mjs",
+      "ruling": "allowed"
+    },
+    {
+      "file": "scripts/merge-pr.test.mjs",
+      "ruling": "allowed"
+    },
+    {
+      "file": "scripts/receipt.test.mjs",
+      "ruling": "allowed"
+    },
+    {
+      "file": "scripts/slice.test.mjs",
+      "ruling": "allowed"
+    },
+    {
+      "file": "scripts/token-ledger.test.mjs",
+      "ruling": "allowed"
+    }
+  ],
+  "weakenings": [
+    "0e8142fd5a2e",
+    "601194dd66e5",
+    "88b79051bde0",
+    "bfda0cd8399f",
+    "d98f66a40cdd",
+    "ea1a2d99f30a"
+  ],
+  "counts": {
+    "important": 0,
+    "nit": 0,
+    "preExisting": 0
+  },
+  "level": "standard"
+}
