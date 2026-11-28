@@ -98,8 +98,12 @@
 //   node scripts/receipt.mjs fingerprints [<branch>]   default HEAD; base is <remote>/<baseBranch>
 //   node scripts/receipt.mjs make <session-file>
 //       Every completed review (including "changes needed" rounds) counts toward maxReviewRounds
-//       (default 10 in scripts/kit.config.json, warning at round 7; REV-6). Refuses past the cap
-//       unless the slice is listed in extraReviewRoundSlices on the base branch.
+//       (default 12 across the slice and branch, warning at round 8; REV-6) and
+//       maxTaskReviewRounds (default 4 per task on the branch, warning at round 3; REV-6).
+//       With graceReviewRound on (default true), allows 1 final convergence grace round (+1) when
+//       the prior round approved or strictly converged to <= 2 important findings with no refused
+//       weakenings. Refuses past the cap unless allowed by grace or extraReviewRoundSlices on base.
+//       When the current branch names a slice, writes an additive integer "slice" field.
 // Exit codes: 0 done, 1 the record makes no receipt (or git failed, or the checklist or the level
 // could not be read while its switch is on "enforce"; on "observe" that is one note and the lines
 // are left out), 2 wrong usage.
@@ -115,7 +119,10 @@ import { fileURLToPath } from 'node:url';
 import { modelOf } from './check-plans.mjs';
 
 export const RECEIPT_DIR = 'docs/receipts/';
-export const DEFAULT_MAX_REVIEW_ROUNDS = 10;
+export const DEFAULT_MAX_REVIEW_ROUNDS = 12;
+export const DEFAULT_MAX_TASK_REVIEW_ROUNDS = 4;
+export const DEFAULT_GRACE_REVIEW_ROUND = true;
+export const REV6_WARN_ROUND = 3;
 export const BLOAT_COMMIT_WARNING = 10;
 const EXIT = { ok: 0, failed: 1, usage: 2 };
 const USAGE = 'Usage:\n  node scripts/receipt.mjs fingerprints [<branch>]   reviewer: list what this review covers and must rule on\n  node scripts/receipt.mjs make <session-file>       head agent: write the receipt from the reviewer\'s record';
@@ -280,9 +287,15 @@ export function buildReceipt(text, sessionPath) {
   return receipt;
 }
 
-// docs/receipts/<task>-<first 8 hex of the receipt's own hash>.json: the same record, the same name.
+// docs/receipts/<task>-<first 8 hex of the core receipt's hash>.json: the same record, the same name.
+// Excludes the additive "slice" metadata field so refreshing an older receipt keeps its exact filename.
 export function receiptPath(receipt) {
-  return `${RECEIPT_DIR}${receipt.task}-${sha256(JSON.stringify(receipt)).slice(0, 8)}.json`;
+  let core = receipt;
+  if (receipt && typeof receipt === 'object' && !Array.isArray(receipt) && Object.hasOwn(receipt, 'slice')) {
+    const { slice: _slice, ...rest } = receipt;
+    core = rest;
+  }
+  return `${RECEIPT_DIR}${receipt.task}-${sha256(JSON.stringify(core)).slice(0, 8)}.json`;
 }
 
 // ---------- Fingerprints (git) ----------
@@ -426,11 +439,59 @@ function bannedModels(models) {
   return named ? banned : null;
 }
 
+// Compares a freshly rebuilt receipt against a written receipt JSON. Allows the additive
+// integer "slice" metadata field written by `receipt.mjs make` while keeping every
+// session-derived field exact. When expectedSlice is given, an explicit written.slice must match it.
+export function receiptMatches(fresh, written, expectedSlice = null) {
+  if (!written || typeof written !== 'object' || Array.isArray(written)) return false;
+  if (Object.hasOwn(written, 'slice')) {
+    if (!Number.isInteger(written.slice) || written.slice < 0) return false;
+    if (expectedSlice != null && written.slice !== expectedSlice) return false;
+    const { slice: _slice, ...rest } = written;
+    return JSON.stringify(fresh) === JSON.stringify(rest);
+  }
+  return JSON.stringify(fresh) === JSON.stringify(written);
+}
+
+// Re-reads a receipt's session record from disk and checks that nothing (counts, rulings, verdict)
+// was hand-edited in the committed receipt JSON.
+export function verifyReceiptRecord(written) {
+  if (!written || typeof written.session !== 'string' || !existsSync(written.session)) return false;
+  try {
+    const fresh = buildReceipt(readFileSync(written.session, 'utf8'), written.session);
+    return receiptMatches(fresh, written);
+  } catch {
+    return false;
+  }
+}
+
+function expectedSliceForRef(tip, git) {
+  const fromTip = branchSlice(tip);
+  if (fromTip !== null) return fromTip;
+  if (tip === 'HEAD') {
+    const head = git(['symbolic-ref', '--short', '-q', 'HEAD']);
+    if (head.code === 0) return branchSlice(head.stdout.trim());
+  }
+  return null;
+}
+
+function receiptIntroSlice(tip, path, git) {
+  const first = git(['log', '-n', '1', '-m', '--first-parent', '--diff-filter=A', '--format=%s', tip, '--', path]);
+  if (first.code === 0) {
+    const s = subjectSlice(first.stdout.trim());
+    if (s !== null) return s;
+  }
+  const any = git(['log', '-n', '1', '--diff-filter=A', '--format=%s', tip, '--', path]);
+  if (any.code === 0) return subjectSlice(any.stdout.trim());
+  return null;
+}
+
 // Every receipt file at the tip that `about` picks and that still matches its session record, read
 // again right now: { list: [{ path, receipt }] } or { fail }. Why one was left out goes into notes.
-function trueReceipts({ tip, git, readFile, notes, about }) {
+function trueReceipts({ tip, git, readFile, notes, about, expectedSlice = undefined }) {
   const listed = git(['ls-tree', '-r', '-z', '--name-only', tip, '--', RECEIPT_DIR]);
   if (listed.code !== 0) return { fail: `cannot list ${RECEIPT_DIR}: ${listed.stderr.trim()}` };
+  const refSlice = expectedSlice !== undefined ? expectedSlice : expectedSliceForRef(tip, git);
   const list = [];
   for (const path of splitZ(listed.stdout).filter((p) => p.endsWith('.json'))) {
     let r;
@@ -441,7 +502,8 @@ function trueReceipts({ tip, git, readFile, notes, about }) {
       notes.push(`${path}: its session record ${r.session} cannot be read again (${e.message}); not counted`);
       continue;
     }
-    if (JSON.stringify(fresh) !== JSON.stringify(r)) {
+    const wantSlice = refSlice ?? (Object.hasOwn(r, 'slice') ? receiptIntroSlice(tip, path, git) : null);
+    if (!receiptMatches(fresh, r, wantSlice)) {
       notes.push(`${path}: does not match its session record; not counted. Make it again: node scripts/receipt.mjs make ${r.session}`);
       continue;
     }
@@ -538,22 +600,51 @@ export function roundKey(receipt) {
   return `task:${receipt.task}`;
 }
 
+// Normalizes a task id by stripping trailing round markers (-r1, _R2, .r3, -round2) so renaming
+// TASK: each round cannot evade the per-task review cap. Bare ids like "1" stay unchanged.
+export function normalizeTaskId(task) {
+  if (typeof task !== 'string') return '';
+  const trimmed = task.trim();
+  if (!trimmed) return '';
+  const stripped = trimmed.replace(/(?:[-_.]r(?:ound)?[-_]?\d+)+$/i, '');
+  return stripped || trimmed;
+}
+
+// Slice number (whole number) from a branch name alone, else null.
+export function branchSlice(branch) {
+  const m = String(branch || '').match(/(?:^|\/)(\d{3})(?=-|$)/);
+  return m ? Number(m[1]) : null;
+}
+
+// Slice number (whole number) from a commit or merge subject, else null.
+export function subjectSlice(subject) {
+  const s = String(subject || '');
+  const branch = s.match(/(?:^|[\s/'"])(?:build|lead|design|fix|feat|chore|review)\/(\d{3,4})(?=-|['"\s/]|$)/i);
+  if (branch) return Number(branch[1]);
+  const conv = s.match(/^\s*(?:docs|feat|fix|chore|refactor|test|build|ci|perf|style)\((\d{3,4})(?:[-)\s]|$)/i);
+  if (conv) return Number(conv[1]);
+  const named = s.match(/\bslice\s+0*(\d{1,4})\b/i);
+  if (named) return Number(named[1]);
+  return null;
+}
+
 // Slice number (whole number) from a branch name or task id, else null.
 export function sliceNumberOf(branch, task) {
-  const fromBranch = String(branch || '').match(/(?:^|\/)(\d{3})(?=-|$)/);
-  if (fromBranch) return Number(fromBranch[1]);
+  const fromBranch = branchSlice(branch);
+  if (fromBranch !== null) return fromBranch;
   const fromTask = String(task || '').match(/(?:^|[-/])(\d{3})(?=-|$)/);
   return fromTask ? Number(fromTask[1]) : null;
 }
 
 const cut = (s, n) => { const t = String(s ?? ''); return t.length <= n ? t : `${t.slice(0, n - 3)}...`; };
 
-// The ask auto-filed when a branch hits the review round cap (same shape as merge-pr's parkedAsk).
-export function reviewCapAsk({ branch, round, maxRounds }) {
+// The ask auto-filed when a branch or task hits a review round cap (same shape as merge-pr's parkedAsk).
+export function reviewCapAsk({ branch, round, maxRounds, task = null }) {
   const where = cut(branch || 'current branch', 100);
+  const scope = task ? `for task ${cut(task, 60)} on ${where}` : `on ${where}`;
   return {
     title: 'What should happen to a branch past the review cap?',
-    why: `Review round ${round} passed the ${maxRounds}-round limit (REV-6) on ${where}, so the agent was told to stop patching it.`,
+    why: `Review round ${round} passed the ${maxRounds}-round limit (REV-6) ${scope}, so the agent was told to stop patching it.`,
     blocks: cut(branch || 'current branch', 120),
     options: [
       'A: Simplify the design and restart on a clean branch',
@@ -563,12 +654,9 @@ export function reviewCapAsk({ branch, round, maxRounds }) {
   };
 }
 
-// Distinct review rounds already added on this branch since baseRef (committed plus uncommitted
-// new files under docs/receipts/). Every completed review (including "changes needed" rounds)
-// counts; replacement receipts for a moved session file share task + at + model and count once.
-// excludePath and excludeKey keep re-running or replacing an existing round idempotent.
-// Returns { count, hasRound } or { fail }.
-export function countBranchReceipts({ baseRef, tip = 'HEAD', git, root = null, excludePath = null, excludeKey = null, includeWorkingTree = true }) {
+// Reads every receipt file added on this branch since baseRef (committed plus optional working tree).
+// Returns { entries: [{ path, receipt }] } or { fail }.
+function readBranchReceipts({ baseRef, tip = 'HEAD', git, root = null, excludePath = null, includeWorkingTree = true }) {
   const paths = new Set();
   if (baseRef) {
     const fork = git(['merge-base', baseRef, tip]);
@@ -595,7 +683,8 @@ export function countBranchReceipts({ baseRef, tip = 'HEAD', git, root = null, e
   }
   for (const p of deleted) paths.delete(p);
   if (excludePath) paths.delete(excludePath);
-  const readKey = (p) => {
+  const entries = [];
+  for (const p of paths) {
     let raw;
     if (root && existsSync(join(root, p))) {
       try {
@@ -608,26 +697,278 @@ export function countBranchReceipts({ baseRef, tip = 'HEAD', git, root = null, e
       if (shown.code !== 0) return { fail: `cannot read receipt ${p}: ${(shown.stderr || 'git show failed').trim()}` };
       raw = shown.stdout;
     }
+    let parsed;
     try {
-      const parsed = JSON.parse(raw);
-      return { key: roundKey(parsed) };
+      parsed = JSON.parse(raw);
     } catch (e) {
       return { fail: `receipt ${p} is not valid JSON: ${e.message}` };
     }
-  };
-  const rounds = new Set();
+    entries.push({ path: p, receipt: parsed });
+  }
+  return { entries };
+}
+
+// Resolves which slice a receipt belongs to: explicit integer slice first, then branch name, then legacy task id.
+export function receiptSliceOf(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (Number.isInteger(parsed.slice)) return parsed.slice;
+  if (typeof parsed.branch === 'string') {
+    const fromBranch = branchSlice(parsed.branch);
+    if (fromBranch !== null) return fromBranch;
+  }
+  if (typeof parsed.task === 'string') {
+    const fromTask = sliceNumberOf(null, parsed.task);
+    if (fromTask !== null) return fromTask;
+  }
+  return null;
+}
+
+// Distinct review rounds already added on this branch since baseRef (committed plus uncommitted
+// new files under docs/receipts/). Every completed review (including "changes needed" rounds)
+// counts; replacement receipts for a moved session file share task + at + model and count once.
+// excludePath and excludeKey keep re-running or replacing an existing round idempotent.
+// Returns { count, hasRound } or { fail }.
+export function countBranchReceipts({ baseRef, tip = 'HEAD', git, root = null, excludePath = null, excludeKey = null, includeWorkingTree = true, includeEntries = false }) {
+  const read = readBranchReceipts({ baseRef, tip, git, root, excludePath, includeWorkingTree });
+  if (read.fail) return { fail: read.fail };
+  const rounds = new Map();
   let hasRound = false;
-  for (const p of paths) {
-    const read = readKey(p);
-    if (read.fail) return { fail: read.fail };
-    const k = read.key ?? `path:${p}`;
+  for (const { path: p, receipt: parsed } of read.entries) {
+    const k = roundKey(parsed) ?? `path:${p}`;
     if (excludeKey && k === excludeKey) {
       hasRound = true;
       continue;
     }
-    rounds.add(k);
+    if (!rounds.has(k)) rounds.set(k, parsed);
   }
-  return { count: rounds.size, hasRound };
+  return includeEntries
+    ? { count: rounds.size, hasRound, entries: [...rounds.values()] }
+    : { count: rounds.size, hasRound };
+}
+
+// Distinct review rounds for the same normalized task id already added on this branch since
+// baseRef, using the same roundKey dedup as countBranchReceipts.
+// Returns { count, hasRound } (or { count, hasRound, entries } when includeEntries is true) or { fail }.
+export function countTaskReceipts({ baseRef, tip = 'HEAD', task, git, root = null, excludePath = null, excludeKey = null, includeWorkingTree = true, includeEntries = false }) {
+  const target = normalizeTaskId(task).toLowerCase();
+  if (!target) return includeEntries ? { count: 0, hasRound: false, entries: [] } : { count: 0, hasRound: false };
+  const read = readBranchReceipts({ baseRef, tip, git, root, excludePath, includeWorkingTree });
+  if (read.fail) return { fail: read.fail };
+  const rounds = new Map();
+  let hasRound = false;
+  for (const { path: p, receipt: parsed } of read.entries) {
+    if (normalizeTaskId(parsed?.task).toLowerCase() !== target) continue;
+    const k = roundKey(parsed) ?? `path:${p}`;
+    if (excludeKey && k === excludeKey) {
+      hasRound = true;
+      continue;
+    }
+    if (!rounds.has(k)) rounds.set(k, parsed);
+  }
+  return includeEntries
+    ? { count: rounds.size, hasRound, entries: [...rounds.values()] }
+    : { count: rounds.size, hasRound };
+}
+
+// One non-repeatable convergence grace round (+1 past maxTaskReviewRounds or maxReviewRounds,
+// at most one per slice) so a converging tail or a post-approval check fix does not park a slice
+// unnecessarily, while flat/rising spirals, single-round unproved counts, and refused/weakened
+// test rulings still hard-STOP.
+export function evaluateGraceRound(
+  priorReceipts,
+  {
+    maxTaskRounds = DEFAULT_MAX_TASK_REVIEW_ROUNDS,
+    maxRounds = DEFAULT_MAX_REVIEW_ROUNDS,
+    taskRound = null,
+    effectiveRound = null,
+    priorGraceUsed = false,
+  } = {},
+) {
+  if (priorGraceUsed) {
+    return { allowed: false, reason: 'a grace round was already used in this slice' };
+  }
+  if (!Array.isArray(priorReceipts) || priorReceipts.length === 0) {
+    return { allowed: false, reason: 'no prior task receipts to prove convergence' };
+  }
+  if (maxTaskRounds !== null && taskRound !== null && taskRound > maxTaskRounds + 1) {
+    return { allowed: false, reason: 'grace round already used for this task' };
+  }
+  if (maxRounds > 0 && effectiveRound !== null && effectiveRound > maxRounds + 1) {
+    return { allowed: false, reason: 'grace round already used for this slice' };
+  }
+  const sorted = priorReceipts
+    .map((r, i) => ({ r, i, ts: Date.parse(r?.at) || 0 }))
+    .sort((a, b) => (a.ts !== b.ts ? a.ts - b.ts : a.i - b.i))
+    .map((x) => x.r);
+  const prev = sorted[sorted.length - 1];
+  if (Array.isArray(prev?.protectedTests) && prev.protectedTests.some((t) => t?.ruling === 'refused' || t?.ruling === 'weakened')) {
+    return { allowed: false, reason: 'prior round refused a protected test weakening' };
+  }
+  const prevImp = prev?.counts?.important;
+  if (typeof prevImp !== 'number' || !Number.isInteger(prevImp) || prevImp < 0) {
+    return { allowed: false, reason: 'prior round has no COUNT line to prove convergence' };
+  }
+  if (prevImp > 2) {
+    return { allowed: false, reason: `${prevImp} important findings remain (grace requires <= 2)` };
+  }
+  if (prevImp === 0) {
+    return {
+      allowed: true,
+      reason: prev?.verdict === 'approve'
+        ? 'prior round approved with 0 important (post-approval check fix)'
+        : 'zero important findings left on prior round',
+    };
+  }
+  if (sorted.length < 2) {
+    return { allowed: false, reason: 'need at least 2 prior rounds to prove convergence when important findings remain' };
+  }
+  const firstImp = sorted[0]?.counts?.important;
+  const prevPrevImp = sorted[sorted.length - 2]?.counts?.important;
+  if (typeof firstImp !== 'number' || typeof prevPrevImp !== 'number') {
+    return { allowed: false, reason: 'earlier rounds lack COUNT lines to prove convergence' };
+  }
+  if (prevImp <= prevPrevImp && prevImp < firstImp) {
+    return { allowed: true, reason: `converging tail (${firstImp} -> ${prevImp} important)` };
+  }
+  return { allowed: false, reason: `important findings did not converge (${firstImp} -> ${prevPrevImp} -> ${prevImp})` };
+}
+
+// Maps each receipt path under docs/receipts/ on baseRef to the slice number from its introducing
+// merge or commit subject, using one first-parent git log pass and falling back to full history
+// only for paths whose first-parent subject did not name a slice.
+export function baseReceiptSlicesFromGit(baseRef, git, neededPaths = null) {
+  const map = new Map();
+  const parseLog = (stdout) => {
+    let curSlice = null;
+    const seen = new Set();
+    for (const rawLine of String(stdout || '').split('\n')) {
+      if (rawLine.startsWith('COMMIT:')) {
+        curSlice = subjectSlice(rawLine.slice(7));
+        continue;
+      }
+      const p = rawLine.trim();
+      if (!p.endsWith('.json') || seen.has(p)) continue;
+      seen.add(p);
+      if (curSlice !== null && !map.has(p)) map.set(p, curSlice);
+    }
+  };
+  const first = git(['log', '-m', '--first-parent', '--name-only', '--diff-filter=A', '--format=format:COMMIT:%s', baseRef, '--', RECEIPT_DIR]);
+  if (first.code === 0) parseLog(first.stdout);
+  const needsFallback = neededPaths ? neededPaths.some((p) => !map.has(p)) : first.code !== 0;
+  if (needsFallback) {
+    const all = git(['log', '--name-only', '--diff-filter=A', '--format=format:COMMIT:%s', baseRef, '--', RECEIPT_DIR]);
+    if (all.code === 0) parseLog(all.stdout);
+  }
+  return map;
+}
+
+// Distinct review rounds for a slice across both:
+//   1. receipts added on the current branch since baseRef (same as countBranchReceipts), and
+//   2. receipts already on baseRef under docs/receipts/ belonging to this slice.
+// Uses git history to map legacy receipts on baseRef without running git show on unrelated slices,
+// and counts receipts whose introducing git commit maps to `slice` even if written.slice was edited.
+// Uses roundKey dedup across both sets so refreshed or moved receipts never double-count.
+// Returns { count, hasRound } or { fail }.
+export function countSliceReceipts({ baseRef, tip = 'HEAD', slice, git, root = null, excludePath = null, excludeKey = null, includeWorkingTree = true, filterBranchBySlice = false, includeEntries = false }) {
+  const read = readBranchReceipts({ baseRef, tip, git, root, excludePath, includeWorkingTree });
+  if (read.fail) return { fail: read.fail };
+  const rounds = new Map();
+  let hasRound = false;
+  const addEntry = (p, parsed) => {
+    const k = roundKey(parsed) ?? `path:${p}`;
+    if (excludeKey && k === excludeKey) {
+      hasRound = true;
+      return;
+    }
+    if (!rounds.has(k)) rounds.set(k, parsed);
+  };
+  for (const { path: p, receipt: parsed } of read.entries) {
+    if (filterBranchBySlice && receiptSliceOf(parsed) !== slice) continue;
+    addEntry(p, parsed);
+  }
+  if (baseRef && Number.isInteger(slice)) {
+    const listed = git(['ls-tree', '-r', '-z', '--name-only', baseRef, '--', RECEIPT_DIR]);
+    if (listed.code !== 0) return { fail: `cannot list ${RECEIPT_DIR} on ${baseRef}: ${listed.stderr.trim()}` };
+    const basePaths = splitZ(listed.stdout).filter((p) => p.endsWith('.json'));
+    const historySlices = basePaths.length ? baseReceiptSlicesFromGit(baseRef, git, basePaths) : new Map();
+    for (const p of basePaths) {
+      if (excludePath && p === excludePath) {
+        hasRound = true;
+        continue;
+      }
+      const historySlice = historySlices.has(p) ? historySlices.get(p) : null;
+      if (historySlice !== null && historySlice !== slice) continue;
+      const shown = git(['show', `${baseRef}:${p}`]);
+      if (shown.code !== 0) return { fail: `cannot read receipt ${p} on ${baseRef}: ${(shown.stderr || 'git show failed').trim()}` };
+      let parsed;
+      try {
+        parsed = JSON.parse(shown.stdout);
+      } catch (e) {
+        return { fail: `receipt ${p} on ${baseRef} is not valid JSON: ${e.message}` };
+      }
+      if (historySlice === slice || (historySlice === null && receiptSliceOf(parsed) === slice)) addEntry(p, parsed);
+    }
+  }
+  return includeEntries
+    ? { count: rounds.size, hasRound, entries: [...rounds.values()] }
+    : { count: rounds.size, hasRound };
+}
+
+function parseKitConfig(raw, cp) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return cp.mergeConfig ? cp.mergeConfig(raw) : raw;
+  }
+  const hasTaskCap = Object.hasOwn(raw, 'maxTaskReviewRounds');
+  const rawTaskCap = hasTaskCap ? raw.maxTaskReviewRounds : undefined;
+  if (hasTaskCap && rawTaskCap !== null && (!Number.isInteger(rawTaskCap) || rawTaskCap < 0)) {
+    throw new Error('scripts/kit.config.json: "maxTaskReviewRounds" must be a whole number of rounds, 0 or more, or null');
+  }
+  const hasGrace = Object.hasOwn(raw, 'graceReviewRound');
+  const rawGrace = hasGrace ? raw.graceReviewRound : undefined;
+  if (hasGrace && typeof rawGrace !== 'boolean') {
+    throw new Error('scripts/kit.config.json: "graceReviewRound" must be true or false');
+  }
+  if (!cp.mergeConfig) return raw;
+  const supportsTaskCap = Boolean(cp.DEFAULT_CONFIG && Object.hasOwn(cp.DEFAULT_CONFIG, 'maxTaskReviewRounds'));
+  const supportsGrace = Boolean(cp.DEFAULT_CONFIG && Object.hasOwn(cp.DEFAULT_CONFIG, 'graceReviewRound'));
+  const cleaned = { ...raw };
+  const overrides = {};
+  if (hasTaskCap && (!supportsTaskCap || rawTaskCap === null)) {
+    delete cleaned.maxTaskReviewRounds;
+    overrides.maxTaskReviewRounds = rawTaskCap;
+  }
+  if (hasGrace && !supportsGrace) {
+    delete cleaned.graceReviewRound;
+    overrides.graceReviewRound = rawGrace;
+  }
+  return { ...cp.mergeConfig(cleaned), ...overrides };
+}
+
+function resolveGraceReviewRound(rawBase, rawLocal) {
+  const baseVal = rawBase && typeof rawBase === 'object' && Object.hasOwn(rawBase, 'graceReviewRound') ? rawBase.graceReviewRound : undefined;
+  const localVal = rawLocal && typeof rawLocal === 'object' && Object.hasOwn(rawLocal, 'graceReviewRound') ? rawLocal.graceReviewRound : undefined;
+  if (baseVal === false || localVal === false) return false;
+  return DEFAULT_GRACE_REVIEW_ROUND;
+}
+
+// Base-vs-local safety rule for maxTaskReviewRounds: take the stricter (smaller) cap so a build
+// branch cannot raise or disable it locally. null (or 0) disables only when base config explicitly
+// sets it (or when maxReviewRounds is explicitly 0 and maxTaskReviewRounds is unset on base) and
+// local config does not set a stricter positive cap.
+function resolveMaxTaskReviewRounds(rawBase, rawLocal, maxRounds = DEFAULT_MAX_REVIEW_ROUNDS) {
+  const baseHasKey = Boolean(rawBase && typeof rawBase === 'object' && Object.hasOwn(rawBase, 'maxTaskReviewRounds'));
+  const baseVal = baseHasKey ? rawBase.maxTaskReviewRounds : undefined;
+  const baseDisabled = baseHasKey && (baseVal === null || baseVal === 0);
+  const baseCap = baseDisabled || (!baseHasKey && maxRounds === 0)
+    ? null
+    : (typeof baseVal === 'number' ? baseVal : DEFAULT_MAX_TASK_REVIEW_ROUNDS);
+
+  const localHasKey = Boolean(rawLocal && typeof rawLocal === 'object' && Object.hasOwn(rawLocal, 'maxTaskReviewRounds'));
+  const localVal = localHasKey ? rawLocal.maxTaskReviewRounds : undefined;
+  const localCap = typeof localVal === 'number' && localVal > 0 ? localVal : null;
+
+  if (baseCap === null) return localCap;
+  return localCap !== null ? Math.min(baseCap, localCap) : baseCap;
 }
 
 // ---------- Command line ----------
@@ -660,30 +1001,39 @@ async function cli(argv) {
       console.error(`No receipt: ${e.code === 'ENOENT' ? `${session} does not exist` : e.message}.`);
       return EXIT.failed;
     }
+    const branchRes = git(['symbolic-ref', '--short', '-q', 'HEAD']);
+    const branch = branchRes.code === 0 ? branchRes.stdout.trim() : '';
+    const fromBranch = branchSlice(branch);
+    if (fromBranch !== null) receipt = { ...receipt, slice: fromBranch };
     const path = receiptPath(receipt);
     const there = existsSync(join(root, path));
     let maxRounds = DEFAULT_MAX_REVIEW_ROUNDS;
+    let maxTaskRounds = DEFAULT_MAX_TASK_REVIEW_ROUNDS;
+    let graceAllowed = DEFAULT_GRACE_REVIEW_ROUND;
     let baseRef = null;
     let cands = [];
     let extraAllowed = [];
     let eventsOn = false;
     try {
       const cp = await import('./check-plans.mjs');
-      const cfg = cp.loadConfig(root);
+      const localCfgPath = join(root, 'scripts/kit.config.json');
+      const hasLocalConfig = existsSync(localCfgPath);
+      const rawLocal = hasLocalConfig ? JSON.parse(readFileSync(localCfgPath, 'utf8')) : null;
+      const cfg = hasLocalConfig ? parseKitConfig(rawLocal, cp) : cp.loadConfig(root);
       const remote = cfg.remote || 'origin';
       const baseBranch = cfg.baseBranch || 'main';
       const exists = (ref) => git(['rev-parse', '-q', '--verify', `${ref}^{commit}`]).code === 0;
       cands = cp.baseCandidates && cfg.remote && cfg.baseBranch ? cp.baseCandidates(cfg) : [`${remote}/${baseBranch}`, baseBranch];
       baseRef = cands.find(exists) ?? null;
+      let rawBase = null;
       let baseCfg = null;
       if (baseRef) {
         const shown = git(['show', `${baseRef}:scripts/kit.config.json`]);
         if (shown.code === 0) {
-          const parsedBase = JSON.parse(shown.stdout);
-          baseCfg = cp.mergeConfig ? cp.mergeConfig(parsedBase) : parsedBase;
+          rawBase = JSON.parse(shown.stdout);
+          baseCfg = parseKitConfig(rawBase, cp);
         }
       }
-      const hasLocalConfig = existsSync(join(root, 'scripts/kit.config.json'));
       const localCap = hasLocalConfig ? (cfg.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS) : null;
       const baseCap = baseCfg ? (baseCfg.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS) : null;
       // When the base branch sets a cap, a branch cannot raise or disable it locally.
@@ -691,6 +1041,21 @@ async function cli(argv) {
         maxRounds = baseCap > 0 && localCap !== null && localCap > 0 ? Math.min(baseCap, localCap) : baseCap;
       } else {
         maxRounds = localCap ?? DEFAULT_MAX_REVIEW_ROUNDS;
+      }
+      maxTaskRounds = resolveMaxTaskReviewRounds(rawBase, rawLocal, maxRounds);
+      graceAllowed = resolveGraceReviewRound(rawBase, rawLocal);
+      // Guard against a branch changing local remote/baseBranch to evade base graceReviewRound: false.
+      const defaultCand = ['origin/main', 'main'].find(exists) ?? null;
+      if (graceAllowed && defaultCand && defaultCand !== baseRef) {
+        const shownDef = git(['show', `${defaultCand}:scripts/kit.config.json`]);
+        if (shownDef.code === 0) {
+          try {
+            const rawDef = JSON.parse(shownDef.stdout);
+            if (!resolveGraceReviewRound(rawDef, rawLocal)) graceAllowed = false;
+          } catch {
+            // Keep existing baseRef decision if defaultCand has invalid JSON.
+          }
+        }
       }
       // Only the base branch's extraReviewRoundSlices counts, so a build branch cannot allow itself extra rounds.
       extraAllowed = Array.isArray(baseCfg?.extraReviewRoundSlices) ? baseCfg.extraReviewRoundSlices : [];
@@ -700,51 +1065,129 @@ async function cli(argv) {
       console.error(`Settings could not be read: ${e.message}`);
       return EXIT.usage;
     }
-    if (maxRounds > 0 && !baseRef) {
+    const needCounts = maxRounds > 0 || maxTaskRounds !== null;
+    if (needCounts && !baseRef) {
       console.error(`Cannot count review rounds: no base branch found (tried ${cands.join(' and ')}). Fetch first.`);
       return EXIT.failed;
     }
-    const branchRes = git(['symbolic-ref', '--short', '-q', 'HEAD']);
-    const branch = branchRes.code === 0 ? branchRes.stdout.trim() : '';
-    const slice = sliceNumberOf(branch, receipt.task);
+    const slice = fromBranch ?? sliceNumberOf(null, receipt.task);
     const sliceAllowed = slice !== null && extraAllowed.includes(slice);
-    const counted = maxRounds > 0
-      ? countBranchReceipts({ baseRef, git, root, excludePath: path, excludeKey: roundKey(receipt) })
-      : { count: 0, hasRound: false };
-    if (counted.fail) {
-      console.error(`Cannot count review rounds: ${counted.fail}`);
+    const key = roundKey(receipt);
+    const branchCounted = needCounts
+      ? countBranchReceipts({ baseRef, git, root, excludePath: path, excludeKey: key, includeEntries: true })
+      : { count: 0, hasRound: false, entries: [] };
+    if (branchCounted.fail) {
+      console.error(`Cannot count review rounds: ${branchCounted.fail}`);
       return EXIT.failed;
     }
-    const round = counted.count + 1;
-    if (!there && !counted.hasRound && maxRounds > 0 && round > maxRounds && !sliceAllowed) {
-      let askNote = '';
-      if (eventsOn) {
-        try {
-          const { listAsks, newAsk } = await import('./ask.mjs');
-          const body = reviewCapAsk({ branch: branch || receipt.task, round, maxRounds });
-          const existing = listAsks(root).find((a) => a.status === 'open' && a.blocks === body.blocks && a.title === body.title);
-          if (existing) askNote = ` An ask for Stephen is already filed (id ${existing.id}).`;
-          else {
-            const filed = newAsk(root, { ...body, slice });
-            askNote = ` An ask for Stephen was filed (id ${filed.id}).`;
-          }
-        } catch {
-          // Best-effort ask filing: never hide the STOP refusal.
-        }
-      }
-      console.error(`STOP: Review round ${round} exceeds maxReviewRounds (${maxRounds}) on this branch (REV-6). Every completed review (including "changes needed" rounds) counts. Do not keep patching or override this cap.${askNote} Park this task and move to other work until Stephen answers or adds the slice to extraReviewRoundSlices on the base branch.`);
+    const sliceCounted = needCounts && slice !== null
+      ? countSliceReceipts({ baseRef, slice, git, root, excludePath: path, excludeKey: key, includeEntries: true })
+      : branchCounted;
+    if (sliceCounted.fail) {
+      console.error(`Cannot count review rounds: ${sliceCounted.fail}`);
       return EXIT.failed;
+    }
+    const taskCounted = needCounts
+      ? countTaskReceipts({ baseRef, task: receipt.task, git, root, excludePath: path, excludeKey: key, includeEntries: true })
+      : { count: 0, hasRound: false, entries: [] };
+    if (taskCounted.fail) {
+      console.error(`Cannot count review rounds: ${taskCounted.fail}`);
+      return EXIT.failed;
+    }
+    const targetTaskNorm = normalizeTaskId(receipt.task).toLowerCase();
+    // Combine branch + same-slice base receipts for this task so make matches merge-pr.mjs,
+    // and check whether any task in this slice already spent a grace round.
+    const priorTaskByKey = new Map();
+    for (const r of taskCounted.entries ?? []) {
+      const rk = roundKey(r) ?? `${r?.task}|${r?.at}`;
+      if (!priorTaskByKey.has(rk)) priorTaskByKey.set(rk, r);
+    }
+    const sliceTaskCounts = new Map();
+    for (const r of sliceCounted.entries ?? []) {
+      const norm = normalizeTaskId(r?.task).toLowerCase();
+      if (!norm) continue;
+      const rk = roundKey(r) ?? `${r?.task}|${r?.at}`;
+      if (!sliceTaskCounts.has(norm)) sliceTaskCounts.set(norm, new Set());
+      sliceTaskCounts.get(norm).add(rk);
+      if (norm === targetTaskNorm && !priorTaskByKey.has(rk)) priorTaskByKey.set(rk, r);
+    }
+    const priorTaskEntries = [...priorTaskByKey.values()];
+    const priorGraceUsed = maxTaskRounds !== null && [...sliceTaskCounts.entries()]
+      .some(([norm, set]) => norm !== targetTaskNorm && set.size > maxTaskRounds);
+    const branchRound = branchCounted.count + 1;
+    const sliceRound = slice !== null ? sliceCounted.count + 1 : branchRound;
+    const effectiveRound = slice !== null ? Math.max(branchRound, sliceRound) : branchRound;
+    const taskRound = priorTaskEntries.length + 1;
+    const alreadyCounted = there || branchCounted.hasRound || sliceCounted.hasRound || taskCounted.hasRound;
+    const maxSliceLabel = maxRounds > 0 ? `/${maxRounds}` : '';
+    const maxTaskLabel = maxTaskRounds !== null ? `/${maxTaskRounds}` : '';
+    const countsSummary = slice !== null
+      ? `slice total ${effectiveRound}${maxSliceLabel}, branch ${branchRound}, task ${taskRound}${maxTaskLabel}`
+      : `branch ${branchRound}${maxSliceLabel}, task ${taskRound}${maxTaskLabel}`;
+    const fileCapAsk = async ({ round, maxRounds: cap, task = null }) => {
+      if (!eventsOn) return '';
+      try {
+        const { listAsks, newAsk } = await import('./ask.mjs');
+        const body = reviewCapAsk({ branch: branch || receipt.task, round, maxRounds: cap, task });
+        const existing = listAsks(root).find((a) => a.status === 'open' && a.blocks === body.blocks && a.title === body.title);
+        if (existing) return ` An ask for Stephen is already filed (id ${existing.id}).`;
+        const filed = newAsk(root, { ...body, slice });
+        return ` An ask for Stephen was filed (id ${filed.id}).`;
+      } catch {
+        // Best-effort ask filing: never hide the STOP refusal.
+        return '';
+      }
+    };
+    const taskOver = !alreadyCounted && maxTaskRounds !== null && taskRound > maxTaskRounds && !sliceAllowed;
+    const sliceOver = !alreadyCounted && maxRounds > 0 && effectiveRound > maxRounds && !sliceAllowed;
+    let usedGrace = null;
+    if (taskOver || sliceOver) {
+      const grace = graceAllowed
+        ? evaluateGraceRound(priorTaskEntries, { maxTaskRounds, maxRounds, taskRound, effectiveRound, priorGraceUsed })
+        : { allowed: false, reason: 'graceReviewRound is disabled' };
+      if (grace.allowed) {
+        usedGrace = grace.reason;
+      } else if (taskOver) {
+        const askNote = await fileCapAsk({ round: taskRound, maxRounds: maxTaskRounds, task: receipt.task });
+        console.error(`STOP: Review round ${taskRound} for task ${receipt.task} exceeds maxTaskReviewRounds (${maxTaskRounds}) (REV-6; ${countsSummary}). Every completed review (including "changes needed" rounds) counts. Do not keep patching or override this cap.${askNote} Rethink or split this task, or park it until Stephen answers or adds the slice to extraReviewRoundSlices on the base branch.`);
+        return EXIT.failed;
+      } else {
+        const askNote = await fileCapAsk({ round: effectiveRound, maxRounds });
+        const scopeText = slice !== null && sliceRound > branchRound ? `across slice ${String(slice).padStart(3, '0')}` : 'on this branch';
+        console.error(`STOP: Review round ${effectiveRound} exceeds maxReviewRounds (${maxRounds}) ${scopeText} (REV-6; ${countsSummary}). Every completed review (including "changes needed" rounds) counts. Do not keep patching or override this cap.${askNote} Park this task and move to other work until Stephen answers or adds the slice to extraReviewRoundSlices on the base branch.`);
+        return EXIT.failed;
+      }
     }
     mkdirSync(join(root, RECEIPT_DIR), { recursive: true });
     if (!there) writeFileSync(join(root, path), `${JSON.stringify(receipt, null, 2)}\n`);
+    if (usedGrace) {
+      if (eventsOn) {
+        try {
+          const { appendEvent } = await import('./events.mjs');
+          appendEvent(root, {
+            type: 'review-grace',
+            slice,
+            branch: branch || null,
+            model: receipt.model,
+            data: { task: receipt.task, taskRound, effectiveRound, reason: usedGrace, verdict: receipt.verdict },
+          });
+        } catch {
+          // Best-effort event logging: never fail receipt writing.
+        }
+      }
+      console.log(`Grace round used (REV-6): ${usedGrace} (${countsSummary}). This is the final allowed round; if not approved, STOP and park.`);
+    }
     const n = receipt.fingerprints.length;
     console.log(`${there ? 'Already there' : 'Wrote'} ${path}: ${receipt.verdict} by ${receipt.model} (${receipt.tool}), task ${receipt.task}, ${n} commit${n === 1 ? '' : 's'}, ${receipt.protectedTests.length} ruling${receipt.protectedTests.length === 1 ? '' : 's'} by name.`);
     const warnAt = maxRounds > 0 ? Math.min(maxRounds, Math.max(1, Math.round(maxRounds * 0.7))) : 0;
-    if (maxRounds > 0 && round >= warnAt && round <= maxRounds && receipt.verdict !== 'approve') {
-      console.log(`Warning (REV-6): This branch is on review round ${round} of ${maxRounds} with changes still needed. Stop and check whether the design should be simplified before another round.`);
+    if (maxRounds > 0 && effectiveRound >= warnAt && effectiveRound <= maxRounds && receipt.verdict !== 'approve') {
+      console.log(`Warning (REV-6): This branch is on review round ${effectiveRound} of ${maxRounds} (${countsSummary}) with changes still needed. Stop and check whether the design should be simplified before another round.`);
     }
-    if (round >= 3 && receipt.verdict !== 'approve' && n >= BLOAT_COMMIT_WARNING) {
-      console.log(`Warning (REV-6): This branch has ${n} code commits on review round ${round}. Avoid patch-on-patch spirals: hand fixes to a fresh builder or simplify the design.`);
+    if (taskRound >= REV6_WARN_ROUND && receipt.verdict !== 'approve') {
+      console.log(`Warning (REV-6): Task ${receipt.task} is on review round ${taskRound}${maxTaskLabel} (${countsSummary}) with changes still needed. Stop patching symptoms and rethink or split the task before running another round.`);
+    }
+    if (effectiveRound >= 3 && receipt.verdict !== 'approve' && n >= BLOAT_COMMIT_WARNING) {
+      console.log(`Warning (REV-6): This branch has ${n} code commits on review round ${effectiveRound}. Avoid patch-on-patch spirals: hand fixes to a fresh builder or simplify the design.`);
     }
     const c = receipt.counts;
     if (c) console.log(`Findings counted: ${c.important} important, ${c.nit} nit, ${c.preExisting} pre-existing. The builder answers each one in the branch's findings file (node scripts/findings.mjs lists them).`);

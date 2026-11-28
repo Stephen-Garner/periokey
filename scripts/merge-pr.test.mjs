@@ -5,7 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,10 +13,12 @@ import { fileURLToPath } from 'node:url';
 import {
   API_MARKER, CACHE_FILE, EXIT, MANIFEST_FILE, MAX_AGE_MS, MAX_TRIES, MERGE_CALL_SECONDS, MERGE_LOCK_MINUTES,
   BLOCK_LOG_FILE, FEATURES, cacheKey, checkOnly, checkerApi, checkerArgs, exec, findDuplicateNumbers, formatComment, isCached, isLeadBranch, logStamp, mergePr, parseArgs, parseStatusZ,
-  pickTier, planChecks, protectedTestsChanged, pruneCache, readCache, recordPass, runPostMergeCleanup, settings, splitTests, writeCache,
+  pickTier, planChecks, protectedTestsChanged, pruneCache, readCache, recordPass, runPostMergeCleanup, mainCheckout, isOneShotShell, cleanupIgnorePids, settings, splitTests, writeCache,
   RETRY_CAP, failStreak, parkedAsk, parseNameStatus, planIsDone, plansMovedToCompleted, riskOf,
-  LEVEL_ORDER, MODES, VERIFIED_REASON_MIN, WATCHERS, guardScope, modeOf, reviewScope, stricter, uncoveredBy, verifiedRule,
+  LEVEL_ORDER, MODES, VERIFIED_REASON_MIN, WATCHERS, defaultSliceHealth, guardScope, modeOf, reviewCapsFromBase, reviewScope, stricter, uncoveredBy, verifiedRule,
+  DEFAULT_MAX_PR_PRODUCT_LINES, checkPrSizeWarning, countPrProductAddedLines, parseNumstatZ,
 } from './merge-pr.mjs';
+import { baseReceiptSlicesFromGit, countBranchReceipts, countSliceReceipts, countTaskReceipts, evaluateGraceRound, normalizeTaskId, receiptSliceOf, roundKey } from './receipt.mjs';
 import { checkAsk } from './ask.mjs';
 import { branchSlice, checkMessage, parseVerified } from './commit-msg.mjs';
 import { pathMatches } from './checklist.mjs';
@@ -24,7 +26,7 @@ import { answerLine } from './findings.mjs';
 import { LEVELS } from './review-level.mjs';
 import { KINDS } from './test-changes.mjs';
 import { parseTasks } from './check-plans.mjs';
-import { taskStates } from './slice.mjs';
+import { sliceHealth, taskStates } from './slice.mjs';
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'merge-pr.mjs');
 const PAPERWORK = ['docs/', 'AGENTS.md'];
@@ -91,7 +93,7 @@ const FLAGS_OFF = { protectedTests: false, reviewReceipts: false, mergeLock: fal
 const MODES_OFF = Object.fromEntries(Object.keys(FLAGS_OFF).map((name) => [name, 'off']));
 
 test('settings fills defaults and fails loud on a bad checks list', () => {
-  assert.deepEqual(settings({}), { baseBranch: 'main', remote: 'origin', leadPrefixes: ['lead/'], paperworkPaths: ['docs/', 'AGENTS.md'], checks: [], features: FLAGS_OFF, numberedPaths: ['docs/plans/', 'docs/decisions/'], testPaths: TEST_PATHS, models: { headAgent: [], builder: '', reviewer: '' }, highRiskPaths: [], presets: [], checkSettingsPaths: [], snapshotPaths: [], plansDir: 'docs/plans', buildPrefix: 'build/', productPaths: [], modes: MODES_OFF });
+  assert.deepEqual(settings({}), { baseBranch: 'main', remote: 'origin', leadPrefixes: ['lead/'], paperworkPaths: ['docs/', 'AGENTS.md'], checks: [], features: FLAGS_OFF, numberedPaths: ['docs/plans/', 'docs/decisions/'], testPaths: TEST_PATHS, models: { headAgent: [], builder: '', reviewer: '' }, highRiskPaths: [], presets: [], checkSettingsPaths: [], snapshotPaths: [], plansDir: 'docs/plans', buildPrefix: 'build/', productPaths: [], maxPrProductLines: 700, modes: MODES_OFF });
   assert.throws(() => settings({ checks: [{ name: 'test' }] }), /"name" and a "run"/);
   for (const name of ['rules', 'kit tests', 'script tests']) assert.throws(() => settings({ checks: [{ name, run: 'x' }] }), /may not be named/);
   assert.throws(() => settings({ checks: [{ name: 'a', run: 'x' }, { name: 'a', run: 'y' }] }), /two checks/);
@@ -342,6 +344,8 @@ function fakeMachine(over = {}) {
     if (a.startsWith('diff --name-status -z -M origin/main...HEAD') && s.nameStatus !== null) return s.nameStatus === false ? no('bad revision') : ok(s.nameStatus);
     if (a === 'ls-files -z --cached --others --exclude-standard' && s.tracked) return ok(s.tracked.join('\0'));
     if (a === 'diff --numstat origin/main...HEAD' && s.numstat !== null) return ok(s.numstat);
+    // The size warning reads the NUL-separated form; the fake turns each line into one record.
+    if (a === 'diff --numstat -z origin/main...HEAD' && s.numstat !== null) return ok(s.numstat.split('\n').filter(Boolean).map((l) => `${l}\0`).join(''));
     if (a.startsWith('show HEAD:') && s.shown[a.slice('show HEAD:'.length)] !== undefined) return ok(s.shown[a.slice('show HEAD:'.length)]);
     throw new Error(`fake git does not know: git ${a}`);
   };
@@ -4079,14 +4083,22 @@ test('post-merge cleanup does not run on --check, queued merges, or failed merge
     assert.deepEqual(failCalls, []);
   } finally { failed.cleanup(); }
 
-  const queued = withEvents(fakeMachine({ ...EVENTS(), mergeQueued: true }));
+  const queued = withEvents(fakeMachine({
+    ...EVENTS(),
+    pr: { number: 7, state: 'OPEN', isDraft: false, headRefName: 'build/082-queued', baseRefName: 'main' },
+    branch: 'build/082-queued',
+    files: ['apps/mobile/a.ts'],
+    mergeQueued: true,
+  }));
   const queueCalls = [];
   queued.ctx.cleanWorktrees = (arg) => { queueCalls.push(arg); };
   try {
     assert.equal(merge(queued), EXIT.ok);
     assert.deepEqual(queueCalls, [], 'queued pull request with empty gh merge output does not run cleanup');
     assert.equal(types(queued).includes('merged'), false, 'queued pull request is not recorded as merged');
+    assert.equal(types(queued).includes('pr-merged'), false, 'queued pull request does not record pr-merged');
     assert.match(printed(queued), /not merged yet/);
+    assert.match(printed(queued), /pr-merged event not recorded yet: pull request is not in MERGED state yet/);
     assert.match(printed(queued), /worktree cleanup skipped: pull request is not in MERGED state yet/);
   } finally { queued.cleanup(); }
 
@@ -4164,4 +4176,943 @@ test('runPostMergeCleanup passes expected flags and reports success, partial fai
     execFn: () => ({ code: 1, stdout: '', stderr: 'Could not list open pull requests' }),
   });
   assert.equal(skipped.line, 'note  worktree cleanup skipped: Could not list open pull requests');
+});
+
+test('mainCheckout reads the first worktree git lists, and falls back to root when git cannot say', () => {
+  const list = 'worktree /Users/me/dev/app\nHEAD aaa\nbranch refs/heads/main\n\nworktree /Users/me/dev/app-000\nHEAD bbb\nbranch refs/heads/lead/000-foundation\n';
+  const calls = [];
+  const fake = (cmd, args, cwd) => { calls.push([cmd, args, cwd]); return { code: 0, stdout: list, stderr: '' }; };
+  assert.equal(mainCheckout('/Users/me/dev/app-000', fake), '/Users/me/dev/app');
+  assert.deepEqual(calls[0], ['git', ['worktree', 'list', '--porcelain'], '/Users/me/dev/app-000']);
+  assert.equal(mainCheckout('/x', () => ({ code: 128, stdout: '', stderr: 'not a git repo' })), '/x');
+  assert.equal(mainCheckout('/x', () => ({ code: 0, stdout: '', stderr: '' })), '/x');
+});
+
+test('isOneShotShell: a shell running -c is one-shot; an interactive or login shell, or another program, is not', () => {
+  for (const yes of ['/bin/zsh -c cd /wt && node scripts/merge-pr.mjs 1', 'zsh -lc node scripts/merge-pr.mjs 1', 'bash -c x', '/bin/sh -c x', 'bash --norc -c x']) {
+    assert.equal(isOneShotShell(yes), true, yes);
+  }
+  for (const no of ['-zsh', '/bin/zsh', 'zsh -l', 'zsh -i', 'bash script.sh -c', 'node /x/claude -c', '/Applications/Code.app/x', '', undefined, 'zsh -- -c']) {
+    assert.equal(isOneShotShell(no), false, String(no));
+  }
+});
+
+test('cleanupIgnorePids: nothing from the main checkout; this script from a linked worktree; its parent only if a one-shot shell', () => {
+  const ps = (out, code = 0) => { const seen = []; const fn = (cmd, args) => { seen.push([cmd, ...args]); return { code, stdout: out, stderr: '' }; }; fn.seen = seen; return fn; };
+  const main = ps('/bin/zsh -c x\n');
+  assert.deepEqual(cleanupIgnorePids('/repo', '/repo', { pid: 50, ppid: 40, execFn: main }), []);
+  assert.equal(main.seen.length, 0, 'from the main checkout it never asks ps');
+  const oneShot = ps('/bin/zsh -c cd /wt && node scripts/merge-pr.mjs 1\n');
+  assert.deepEqual(cleanupIgnorePids('/repo-000', '/repo', { pid: 50, ppid: 40, execFn: oneShot }), [50, 40]);
+  assert.deepEqual(oneShot.seen[0], ['ps', '-o', 'args=', '-p', '40']);
+  assert.deepEqual(cleanupIgnorePids('/repo-000', '/repo', { pid: 50, ppid: 40, execFn: ps('-zsh\n') }), [50], 'an interactive terminal still keeps the folder');
+  assert.deepEqual(cleanupIgnorePids('/repo-000', '/repo', { pid: 50, ppid: 40, execFn: ps('', 1) }), [50], 'ps failing ignores only this script');
+  assert.deepEqual(cleanupIgnorePids('/repo-000', '/repo', { pid: 50, ppid: 1, execFn: ps('/bin/zsh -c x') }), [50], 'never pid 1');
+});
+
+test('runPostMergeCleanup runs from the main checkout and passes each --ignore-pid', () => {
+  const seen = [];
+  const r = runPostMergeCleanup({
+    baseRef: 'origin/main', branch: 'lead/000-foundation', root: '/repo-000', mainRoot: '/repo', ignorePids: [50, 40], scriptPath: SCRIPT,
+    execFn: (cmd, args, cwd) => { seen.push({ args, cwd }); return { code: 0, stdout: 'Done. Removed 1 worktrees. No branch was deleted.\n', stderr: '' }; },
+  });
+  assert.equal(seen[0].cwd, '/repo', 'cleanup runs from the main checkout, never the merged worktree');
+  assert.deepEqual(seen[0].args.slice(1), ['--delete', '--base', 'origin/main', '--merged-branch', 'lead/000-foundation', '--ignore-pid', '50', '--ignore-pid', '40']);
+  assert.equal(r.line, 'note  worktrees: Done. Removed 1 worktrees. No branch was deleted.');
+});
+
+// A real repo: the merge runs from inside the merged worktree, started the way agents start it.
+function linkedWorktreeSandbox() {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'merge-from-wt-')));
+  const sh = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  sh(['init', '-q', '--bare', '-b', 'main', join(base, 'origin.git')], base);
+  const repo = join(base, 'repo');
+  sh(['clone', '-q', join(base, 'origin.git'), repo], base);
+  sh(['config', 'user.email', 't@t'], repo); sh(['config', 'user.name', 't'], repo); sh(['config', 'commit.gpgsign', 'false'], repo);
+  writeFileSync(join(repo, 'a.txt'), 'a'); sh(['add', '.'], repo); sh(['commit', '-q', '-m', 'a'], repo); sh(['push', '-q', 'origin', 'main'], repo);
+  const wt = (name, args) => { const p = join(base, name); sh(['worktree', 'add', '-q', ...args, p, 'origin/main'], repo); return p; };
+  const merged = wt('repo-000', ['-b', 'lead/000-foundation']);
+  writeFileSync(join(merged, 'm.txt'), 'm'); sh(['add', '.'], merged); sh(['commit', '-q', '-m', 'm'], merged);
+  sh(['push', '-q', 'origin', 'HEAD:main'], merged); sh(['fetch', '-q', 'origin'], repo);
+  const commit = sh(['rev-parse', 'HEAD'], merged).trim();
+  const dirty = wt('repo-dirty', ['--detach']); writeFileSync(join(dirty, 'new.txt'), 'x');
+  const busy = wt('repo-busy', ['--detach']);
+  const threaded = wt('repo-thread', ['--detach']);
+  const t3Home = join(base, 't3home'); mkdirSync(join(t3Home, 'worktrees'), { recursive: true });
+  const t3 = join(base, 'fake-t3');
+  writeFileSync(t3, `#!/usr/bin/env node\nconst a = process.argv.slice(2);\nif (a[1] === 'list') console.log(JSON.stringify([{ threadId: 'thread-1', title: 'live', settled: false }]));\nelse console.log(JSON.stringify({ thread: { title: 'live', worktreePath: ${JSON.stringify(threaded)} } }));\n`);
+  chmodSync(t3, 0o755);
+  const merge = join(dirname(fileURLToPath(import.meta.url)), 'merge-pr.mjs');
+  const clean = join(dirname(fileURLToPath(import.meta.url)), 'clean-worktrees.mjs');
+  // Stands in for the end of `node scripts/merge-pr.mjs <PR>`: the same cleanup call cli() makes.
+  const inner = join(base, 'inner.mjs');
+  writeFileSync(inner, `import { mainCheckout, cleanupIgnorePids, runPostMergeCleanup } from ${JSON.stringify(merge)};
+import { execFileSync } from 'node:child_process';
+const root = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+const mainRoot = mainCheckout(root);
+const ignorePids = cleanupIgnorePids(root, mainRoot);
+const r = runPostMergeCleanup({ baseRef: 'origin/main', branch: 'lead/000-foundation', commit: ${JSON.stringify(commit)}, root, mainRoot, ignorePids, scriptPath: ${JSON.stringify(clean)} });
+console.log(JSON.stringify({ mainRoot, ignorePids, pid: process.pid, ppid: process.ppid, line: r?.line }));
+`);
+  const env = { ...process.env, WORKTREE_BASE: '', WORKTREE_IDLE_HOURS: '0', WORKTREE_OPEN_PR_BRANCHES: '', T3CODE_HOME: t3Home, T3CODE_CLI_PATH: t3 };
+  return { base, repo, merged, dirty, busy, threaded, inner, env, cleanup: () => rmSync(base, { recursive: true, force: true }) };
+}
+
+test('merging from inside a linked worktree via a one-shot shell removes that worktree at once, and keeps busy, dirty, and T3 Code worktrees', async () => {
+  const s = linkedWorktreeSandbox();
+  const busyKid = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { cwd: s.busy, stdio: 'ignore' });
+  try {
+    await new Promise((r) => busyKid.once('spawn', r));
+    // `; true` stops the shell from replacing itself with node, as a real agent's `cd && node` shell may not.
+    const r = spawnSync('/bin/zsh', ['-c', `cd ${JSON.stringify(s.merged)} && node ${JSON.stringify(s.inner)}; true`], { encoding: 'utf8', env: s.env });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = JSON.parse(r.stdout.trim().split('\n').at(-1));
+    assert.equal(out.mainRoot, s.repo, 'the main checkout is found from inside the linked worktree');
+    assert.deepEqual(out.ignorePids, [out.pid, out.ppid], 'the merge script and its one-shot shell are passed');
+    assert.equal(out.line, 'note  worktrees: Done. Removed 1 worktrees. No branch was deleted. Log: ' + join(s.repo, '.git', 'worktree-cleanup.log'));
+    assert.equal(existsSync(s.merged), false, 'the just-merged worktree is removed right away');
+    for (const p of [s.repo, s.dirty, s.busy, s.threaded]) assert.ok(existsSync(p), `${p} is kept`);
+  } finally { busyKid.kill(); s.cleanup(); }
+});
+
+test('merging from inside a linked worktree from an interactive shell keeps the worktree: that shell may still be in use', () => {
+  const s = linkedWorktreeSandbox();
+  try {
+    // No -c: the shell reads its commands as a person at a terminal would.
+    const r = spawnSync('/bin/sh', [], { input: `cd ${JSON.stringify(s.merged)} && node ${JSON.stringify(s.inner)}\nexit 0\n`, encoding: 'utf8', env: s.env });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = JSON.parse(r.stdout.trim().split('\n').at(-1));
+    assert.deepEqual(out.ignorePids, [out.pid], 'only the merge script itself is passed');
+    assert.ok(existsSync(s.merged), 'the shell still sitting in the worktree keeps it');
+  } finally { s.cleanup(); }
+});
+
+// ---------- Automatic merge odometer ----------
+
+test('odometer: 1st code PR and paperwork PR do not trigger handoff; 2nd code PR prints HANDOFF REQUIRED; slice-handoff resets it', () => {
+  const codePr = (number, headRefName) => ({ number, state: 'OPEN', isDraft: false, headRefName, baseRefName: 'main' });
+  const m = withEvents(fakeMachine({
+    ...EVENTS(),
+    pr: codePr(10, 'build/082-order'),
+    branch: 'build/082-order',
+    files: ['apps/mobile/save.ts'],
+    numstat: NUMSTAT,
+    nameStatus: z('M', 'apps/mobile/save.ts'),
+  }));
+  m.ctx.sliceHealth = sliceHealth;
+  m.ctx.branchSlice = branchSlice;
+  try {
+    // 1st code PR for slice 82: writes pr-merged, does NOT trigger handoff warning.
+    assert.equal(mergePr(parseArgs(['10']), m.ctx), EXIT.ok);
+    const firstOut = m.calls.out.join('\n');
+    assert.doesNotMatch(firstOut, /HANDOFF REQUIRED \(odometer\)/);
+    const prEvents1 = m.events.filter((e) => e.type === 'pr-merged');
+    assert.equal(prEvents1.length, 1);
+    assert.deepEqual(prEvents1[0].data, { pr: 10, branch: 'build/082-order', tier: 'code' });
+    assert.equal(prEvents1[0].slice, 82);
+
+    // Paperwork PR for slice 82: does NOT trigger handoff and does NOT count toward code PR limit.
+    m.calls.out.length = 0;
+    m.state.pr = codePr(11, 'build/082-docs');
+    m.state.branch = 'build/082-docs';
+    m.state.files = ['docs/handoff.md'];
+    m.state.numstat = '1\t0\tdocs/handoff.md\n';
+    m.state.nameStatus = z('M', 'docs/handoff.md');
+    assert.equal(mergePr(parseArgs(['11']), m.ctx), EXIT.ok);
+    assert.doesNotMatch(m.calls.out.join('\n'), /HANDOFF REQUIRED \(odometer\)/);
+
+    // 2nd code PR for slice 82: prints HANDOFF REQUIRED (odometer) right after the merge line.
+    m.calls.out.length = 0;
+    m.state.pr = codePr(12, 'build/082-server');
+    m.state.branch = 'build/082-server';
+    m.state.files = ['apps/mobile/server.ts'];
+    m.state.numstat = NUMSTAT;
+    m.state.nameStatus = z('M', 'apps/mobile/server.ts');
+    assert.equal(mergePr(parseArgs(['12']), m.ctx), EXIT.ok);
+    const mergeIdx = m.calls.out.findIndex((l) => l.startsWith('Merged pull request #12 '));
+    assert.ok(mergeIdx >= 0);
+    assert.equal(m.calls.out[mergeIdx + 1], 'HANDOFF REQUIRED (odometer): 2 code PRs merged since last handoff (limit 2).');
+    assert.equal(
+      m.calls.out[mergeIdx + 2],
+      'Next: run node scripts/slice.mjs handoff --slice 82 --next "<next step>", wait for running workers to finish, and launch a fresh continuation head thread before starting the next task.',
+    );
+    assert.ok(!m.calls.out[mergeIdx + 2].includes('\\"'));
+
+    // A slice-handoff event resets the odometer for the continuation thread.
+    m.events.push({
+      id: 'h1',
+      at: new Date(m.ctx.now()).toISOString(),
+      type: 'slice-handoff',
+      branch: 'lead/082-thread',
+      slice: 82,
+      data: { next: 'Task 3', threadPr: 20, note: null },
+    });
+
+    // 3rd code PR (1st after handoff): does NOT trigger handoff warning.
+    m.calls.out.length = 0;
+    m.state.pr = codePr(13, 'build/082-result');
+    m.state.branch = 'build/082-result';
+    assert.equal(mergePr(parseArgs(['13']), m.ctx), EXIT.ok);
+    assert.doesNotMatch(m.calls.out.join('\n'), /HANDOFF REQUIRED \(odometer\)/);
+
+    // 4th code PR (2nd after handoff): triggers handoff warning again.
+    m.calls.out.length = 0;
+    m.state.pr = codePr(14, 'build/082-polish');
+    m.state.branch = 'build/082-polish';
+    assert.equal(mergePr(parseArgs(['14']), m.ctx), EXIT.ok);
+    assert.match(m.calls.out.join('\n'), /HANDOFF REQUIRED \(odometer\): 2 code PRs merged since last handoff \(limit 2\)\./);
+  } finally { m.cleanup(); }
+});
+
+test('odometer: works with built-in fallback when ctx.sliceHealth is absent, and an odometer error never breaks a completed merge', () => {
+  const m = withEvents(fakeMachine({
+    ...EVENTS(),
+    pr: { number: 21, state: 'OPEN', isDraft: false, headRefName: 'build/083-a', baseRefName: 'main' },
+    branch: 'build/083-a',
+    files: ['apps/mobile/a.ts'],
+    numstat: NUMSTAT,
+    nameStatus: z('M', 'apps/mobile/a.ts'),
+  }));
+  // Pre-seed 1 prior code PR for slice 83; ctx.sliceHealth intentionally omitted.
+  m.events.push({ id: 'p0', at: '2026-11-25T00:00:00Z', type: 'pr-merged', branch: 'build/083-0', slice: 83, data: { pr: 20, branch: 'build/083-0', tier: 'code' } });
+  try {
+    assert.equal(mergePr(parseArgs(['21']), m.ctx), EXIT.ok);
+    assert.match(m.calls.out.join('\n'), /HANDOFF REQUIRED \(odometer\): 2 code PRs merged since last handoff \(limit 2\)\./);
+
+    // If readEvents throws, the completed merge still succeeds cleanly.
+    m.calls.out.length = 0;
+    m.ctx.readEvents = () => { throw new Error('corrupt event log'); };
+    m.state.pr = { number: 22, state: 'OPEN', isDraft: false, headRefName: 'build/083-b', baseRefName: 'main' };
+    assert.equal(mergePr(parseArgs(['22']), m.ctx), EXIT.ok);
+    assert.match(m.calls.out.join('\n'), /Merged pull request #22 /);
+  } finally { m.cleanup(); }
+});
+
+test('odometer: duplicate pr-merged events for the same PR do not trip the 2-PR limit in defaultSliceHealth or mergePr', () => {
+  const dup = defaultSliceHealth(83, [
+    { type: 'pr-merged', slice: 83, at: '2026-11-25T00:00:00Z', data: { pr: 21, branch: 'build/083-a', tier: 'code' } },
+    { type: 'pr-merged', slice: 83, at: '2026-11-25T00:01:00Z', data: { pr: 21, branch: 'build/083-a', tier: 'code' } },
+  ]);
+  assert.equal(dup.codePrsSinceHandoff, 1);
+  assert.equal(dup.totalCodePrs, 1);
+  assert.equal(dup.mergedPrs.length, 1);
+  assert.equal(dup.handoffRecommended, false);
+
+  const m = withEvents(fakeMachine({
+    ...EVENTS(),
+    pr: { number: 21, state: 'OPEN', isDraft: false, headRefName: 'build/083-a', baseRefName: 'main' },
+    branch: 'build/083-a',
+    files: ['apps/mobile/a.ts'],
+    numstat: NUMSTAT,
+    nameStatus: z('M', 'apps/mobile/a.ts'),
+  }));
+  // Pre-seed a duplicate pr-merged record for the same PR #21; ctx.sliceHealth omitted to exercise defaultSliceHealth.
+  m.events.push({ id: 'dup0', at: '2026-11-25T00:00:00Z', type: 'pr-merged', branch: 'build/083-a', slice: 83, data: { pr: 21, branch: 'build/083-a', tier: 'code' } });
+  try {
+    assert.equal(mergePr(parseArgs(['21']), m.ctx), EXIT.ok);
+    assert.doesNotMatch(m.calls.out.join('\n'), /HANDOFF REQUIRED \(odometer\)/);
+  } finally { m.cleanup(); }
+});
+
+test('odometer parity: defaultSliceHealth and sliceHealth return identical results across edge cases', () => {
+  const cases = [
+    [82, [], {}],
+    [82, null, {}],
+    [82, [
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T01:00:00Z', data: { pr: 21, branch: 'build/082-a', tier: 'code' } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T01:05:00Z', data: { pr: 21, branch: 'build/082-a', tier: 'code' } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T01:06:00Z', data: { pr: '21', branch: 'build/082-a', tier: 'code' } },
+    ], {}],
+    [82, [
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T01:00:00Z', data: { pr: null, branch: 'build/082-a', tier: 'code' } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T01:05:00Z', data: { branch: 'build/082-b', tier: 'code' } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T01:10:00Z', data: { pr: '', branch: 'build/082-c', tier: 'paperwork' } },
+    ], {}],
+    [82, [
+      null,
+      { type: 'pr-merged', slice: 99, at: '2026-11-25T00:30:00Z', data: { pr: 50, branch: 'build/099-other', tier: 'code' } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T01:00:00Z', data: { pr: 10, branch: 'build/082-a', tier: 'code' } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T01:10:00Z', data: { pr: 11, branch: 'lead/082-docs', tier: 'paperwork' } },
+      { type: 'task-done', slice: 82, at: '2026-11-25T01:20:00Z', data: { task: 1 } },
+      { type: 'slice-handoff', slice: 82, at: '2026-11-25T02:00:00Z', data: { next: 'Task 2', threadPr: 10, note: null } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T02:05:00Z', data: { pr: 10, branch: 'build/082-a', tier: 'code' } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T02:10:00Z', data: { pr: 12, branch: 'build/082-b', tier: 'code' } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T02:15:00Z', data: { pr: 12, branch: 'build/082-b', tier: 'code' } },
+      { type: 'task-done', slice: 82, at: '2026-11-25T02:20:00Z', data: { task: 2 } },
+      { type: 'task-done', slice: 82, at: '2026-11-25T02:25:00Z', data: { task: 2 } },
+      { type: 'task-done', slice: 82, at: '2026-11-25T02:30:00Z', data: { task: 3 } },
+    ], { maxPrs: 2, maxTasks: 2 }],
+    [82, [
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T01:00:00Z', data: { pr: 10, branch: 'build/082-a', tier: 'code' } },
+      { type: 'slice-handoff', slice: 82, at: '2026-11-25T02:00:00Z', data: { next: 'Task 2', threadPr: 10, note: null } },
+      { type: 'pr-merged', slice: 82, at: '2026-11-25T03:00:00Z', data: { pr: 11, branch: 'build/082-b', tier: 'code' } },
+    ], { maxPrs: 1, maxTasks: 3 }],
+  ];
+  for (const [slice, events, opts] of cases) {
+    assert.deepEqual(defaultSliceHealth(slice, events, opts), sliceHealth(slice, events, opts));
+  }
+});
+
+// ---------- Merge-time review round cap (REV-6 parallel-branch brake) ----------
+
+// Builds a real temp git repo with a bare origin remote to test merge-time receipt caps end to end.
+function parallelReviewRepo({ baseConfig, baseReceipts = [], branchReceipts = [], branchName = 'build/105-part-b', codeFile = 'src/part-b.ts' }) {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'merge-pr-revcap-')));
+  const originDir = join(base, 'origin.git');
+  const root = join(base, 'work');
+  const commonDir = join(root, '.git');
+  const sh = (args, cwd = root) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  sh(['init', '-q', '--bare', '-b', 'main', originDir], base);
+  sh(['clone', '-q', originDir, root], base);
+  sh(['config', 'user.email', 'test@example.com']);
+  sh(['config', 'user.name', 'Test']);
+  sh(['config', 'commit.gpgsign', 'false']);
+  const write = (rel, content) => {
+    mkdirSync(dirname(join(root, rel)), { recursive: true });
+    writeFileSync(join(root, rel), content);
+  };
+  write('scripts/kit.config.json', `${JSON.stringify(baseConfig, null, 2)}\n`);
+  write('scripts/check-plans.mjs', 'export const CHECKER_API = 3;\n');
+  write('scripts/a.test.mjs', '// stub\n');
+  for (const r of baseReceipts) {
+    write(`docs/receipts/${r.file}`, `${JSON.stringify(r.body, null, 2)}\n`);
+  }
+  sh(['add', '-A']);
+  sh(['commit', '-q', '-m', 'chore: base']);
+  sh(['push', '-q', 'origin', 'main']);
+
+  // Create the feature branch from base before any extra parallel branch lands on origin/main.
+  sh(['checkout', '-q', '-b', branchName]);
+  if (codeFile) write(codeFile, 'export const b = 1;\n');
+  for (const r of branchReceipts) {
+    write(`docs/receipts/${r.file}`, `${JSON.stringify(r.body, null, 2)}\n`);
+  }
+  sh(['add', '-A']);
+  sh(['commit', '-q', '-m', 'feat: branch work']);
+  sh(['push', '-q', 'origin', branchName]);
+
+  const out = [];
+  const ghCalls = [];
+  const gitCalls = [];
+  const events = [];
+  let clock = 1_800_000_000_000;
+  let evId = 0;
+  const prObj = { number: 55, state: 'OPEN', isDraft: false, headRefName: branchName, baseRefName: 'main' };
+  const ctx = {
+    root,
+    commonDir,
+    config: settings(baseConfig),
+    git: (args, input) => {
+      gitCalls.push(args.join(' '));
+      return exec('git', args, root, input);
+    },
+    gh: (args) => {
+      ghCalls.push(args);
+      if (args[1] === 'view') {
+        const fields = args[args.indexOf('--json') + 1];
+        if (fields === 'state') return { code: 0, stdout: JSON.stringify({ state: 'MERGED' }), stderr: '' };
+        return { code: 0, stdout: JSON.stringify(prObj), stderr: '' };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    },
+    run: () => ({ code: 0, tail: '' }),
+    print: (line) => out.push(line),
+    now: () => (clock += 100),
+    checkReceipts: () => ({ uncovered: [], covered: 1, notes: [] }),
+    countBranchReceipts,
+    countSliceReceipts,
+    countTaskReceipts,
+    evaluateGraceRound,
+    baseReceiptSlicesFromGit,
+    receiptSliceOf,
+    normalizeTaskId,
+    roundKey,
+    appendEvent: (_root, { type, data, branch, slice }, { now }) => {
+      const e = { id: `e${++evId}`, at: new Date(now).toISOString(), type, branch: branch ?? null, slice: slice ?? null, data };
+      events.push(e);
+      return e;
+    },
+    readEvents: (_root, { types: wanted }) => ({ events: events.filter((e) => wanted.includes(e.type)), skipped: 0 }),
+  };
+
+  // Helper to land a parallel branch commit onto origin/main while this branch stays open.
+  const landOnMain = ({ receipts = [], config = null, commitMessage = 'chore: parallel branch landed' }) => {
+    const tmp = join(base, `main-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`);
+    sh(['clone', '-q', originDir, tmp], base);
+    sh(['config', 'user.email', 'test@example.com'], tmp);
+    sh(['config', 'user.name', 'Test'], tmp);
+    sh(['config', 'commit.gpgsign', 'false'], tmp);
+    if (config) {
+      mkdirSync(join(tmp, 'scripts'), { recursive: true });
+      writeFileSync(join(tmp, 'scripts/kit.config.json'), `${JSON.stringify(config, null, 2)}\n`);
+    }
+    for (const r of receipts) {
+      mkdirSync(join(tmp, 'docs/receipts'), { recursive: true });
+      writeFileSync(join(tmp, `docs/receipts/${r.file}`), `${JSON.stringify(r.body, null, 2)}\n`);
+    }
+    sh(['add', '-A'], tmp);
+    sh(['commit', '-q', '-m', commitMessage], tmp);
+    sh(['push', '-q', 'origin', 'main'], tmp);
+    rmSync(tmp, { recursive: true, force: true });
+  };
+
+  return { ctx, out, ghCalls, gitCalls, events, landOnMain, cleanup: () => rmSync(base, { recursive: true, force: true }) };
+}
+
+const makeReceipt = (file, { task, slice = 105, at, model = 'gpt-6.2-astra', verdict = 'approve', counts } = {}) => {
+  const body = { task, verdict, model, tool: 'codex', at, session: `/tmp/${file}.jsonl`, fingerprints: [], protectedTests: [] };
+  if (slice !== null && slice !== undefined) body.slice = slice;
+  if (counts !== undefined) body.counts = counts;
+  return { file, body };
+};
+
+test('review cap at merge time: parallel branches exceeding maxReviewRounds are blocked in enforce, warned in observe, and allowed via base extraReviewRoundSlices', () => {
+  // Base starts with 9 receipts for slice 105 across tasks 1..3 (3 each, within per-task limit 4).
+  const initial9 = Array.from({ length: 9 }, (_, i) => makeReceipt(`105-t${Math.floor(i / 3) + 1}-r${i + 1}.json`, {
+    task: `105-t${Math.floor(i / 3) + 1}`,
+    slice: 105,
+    at: `2026-11-25T00:0${i}:00Z`,
+  }));
+  // Branch A lands round 10 onto origin/main while Branch B (also at round 10) is open.
+  const branchAReceipt = makeReceipt('105-t4-r10.json', { task: '105-t4', slice: 105, at: '2026-11-25T01:00:00Z' });
+  const branchBReceipt = makeReceipt('105-t5-r10b.json', { task: '105-t5', slice: 105, at: '2026-11-25T01:05:00Z' });
+
+  // 1. enforce mode: merging Branch B combines with origin/main (10 + 1 = 11 > 10) and is blocked.
+  const enforced = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4 },
+    baseReceipts: initial9,
+    branchReceipts: [branchBReceipt],
+  });
+  try {
+    enforced.landOnMain({ receipts: [branchAReceipt] });
+    assert.equal(mergePr(parseArgs(['55']), enforced.ctx), EXIT.failed);
+    const text = enforced.out.join('\n');
+    assert.match(text, /FAIL {2}receipts: review round count \(11\) exceeds maxReviewRounds \(10\) across slice 105 \(REV-6\)\./);
+    assert.deepEqual(enforced.ghCalls.map((c) => c[1]), ['view'], 'blocked before comment or merge');
+    assert.ok(enforced.events.some((e) => e.type === 'merge-blocked' && e.data.check === 'receipts'));
+  } finally { enforced.cleanup(); }
+
+  // 2. observe mode: prints watching only, writes would-block event, and lets merge proceed.
+  const observed = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'observe', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4 },
+    baseReceipts: initial9,
+    branchReceipts: [branchBReceipt],
+  });
+  try {
+    observed.landOnMain({ receipts: [branchAReceipt] });
+    assert.equal(mergePr(parseArgs(['55']), observed.ctx), EXIT.ok);
+    const text = observed.out.join('\n');
+    assert.match(text, /watching only: reviewReceipts would have stopped this merge: receipts: review round count \(11\) exceeds maxReviewRounds \(10\) across slice 105 \(REV-6\)\./);
+    assert.ok(observed.events.some((e) => e.type === 'would-block' && e.data.gate === 'reviewReceipts'));
+    assert.deepEqual(observed.ghCalls.map((c) => c[1]), ['view', 'comment', 'merge', 'view']);
+  } finally { observed.cleanup(); }
+
+  // 3. base extraReviewRoundSlices allows slice 105 past maxReviewRounds even in enforce mode.
+  const waived = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4 },
+    baseReceipts: initial9,
+    branchReceipts: [branchBReceipt],
+  });
+  try {
+    waived.landOnMain({
+      receipts: [branchAReceipt],
+      config: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4, extraReviewRoundSlices: [105] },
+    });
+    assert.equal(mergePr(parseArgs(['55']), waived.ctx), EXIT.ok);
+    assert.match(waived.out.join('\n'), /pass {2}receipts \(1 commit covered by an approving review\)/);
+  } finally { waived.cleanup(); }
+
+  // 4. paperwork PR on slice 105 is not blocked by the code-PR review cap check.
+  const docsOnly = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4 },
+    baseReceipts: [...initial9, branchAReceipt],
+    branchReceipts: [branchBReceipt],
+    branchName: 'lead/105-close',
+    codeFile: null,
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), docsOnly.ctx), EXIT.ok);
+  } finally { docsOnly.cleanup(); }
+});
+
+test('review cap at merge time: per-task maxTaskReviewRounds catches combined rounds across baseRef and branch', () => {
+  const base3 = Array.from({ length: 3 }, (_, i) => makeReceipt(`105-t1-r${i + 1}.json`, {
+    task: `105-t1-r${i + 1}`,
+    slice: 105,
+    verdict: 'changes needed',
+    at: `2026-11-25T00:0${i}:00Z`,
+  }));
+  const branch2 = [
+    makeReceipt('105-t1-r4.json', { task: '105-t1-r4', slice: 105, verdict: 'changes needed', at: '2026-11-25T01:00:00Z' }),
+    makeReceipt('105-t1-r5.json', { task: '105-t1-r5', slice: 105, verdict: 'approve', at: '2026-11-25T01:10:00Z' }),
+  ];
+
+  // Combined 5 rounds for task 105-t1 exceeds maxTaskReviewRounds (4), even though slice total 5 <= 10.
+  const blocked = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4 },
+    baseReceipts: base3,
+    branchReceipts: branch2,
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), blocked.ctx), EXIT.failed);
+    assert.match(blocked.out.join('\n'), /FAIL {2}receipts: review round count \(5\) for task 105-t1 exceeds maxTaskReviewRounds \(4\) \(REV-6\)\./);
+  } finally { blocked.cleanup(); }
+
+  // Disabled via maxTaskReviewRounds: null on base allows the merge.
+  const disabled = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: null },
+    baseReceipts: base3,
+    branchReceipts: branch2,
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), disabled.ctx), EXIT.ok);
+  } finally { disabled.cleanup(); }
+
+  // Kit 5.3.1: converging 5th round approved on a 4-round task passes merge when graceReviewRound is on,
+  // while a 6th round or graceReviewRound: false still blocks.
+  const convBase = [
+    makeReceipt('105-g-r1.json', { task: '105-g', slice: 105, verdict: 'changes needed', counts: { important: 6, nit: 0, preExisting: 0 }, at: '2026-11-27T00:01:00Z' }),
+    makeReceipt('105-g-r2.json', { task: '105-g', slice: 105, verdict: 'changes needed', counts: { important: 3, nit: 0, preExisting: 0 }, at: '2026-11-27T00:02:00Z' }),
+    makeReceipt('105-g-r3.json', { task: '105-g', slice: 105, verdict: 'changes needed', counts: { important: 2, nit: 0, preExisting: 0 }, at: '2026-11-27T00:03:00Z' }),
+  ];
+  const convBranch = [
+    makeReceipt('105-g-r4.json', { task: '105-g', slice: 105, verdict: 'changes needed', counts: { important: 1, nit: 0, preExisting: 0 }, at: '2026-11-27T00:04:00Z' }),
+    makeReceipt('105-g-r5.json', { task: '105-g', slice: 105, verdict: 'approve', counts: { important: 0, nit: 0, preExisting: 0 }, at: '2026-11-27T00:05:00Z' }),
+  ];
+  const graceAllowed = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 12, maxTaskReviewRounds: 4, graceReviewRound: true },
+    baseReceipts: convBase,
+    branchReceipts: convBranch,
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), graceAllowed.ctx), EXIT.ok, 'converging approved R5 grace round merges');
+  } finally { graceAllowed.cleanup(); }
+
+  const graceDisabled = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 12, maxTaskReviewRounds: 4, graceReviewRound: false },
+    baseReceipts: convBase,
+    branchReceipts: convBranch,
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), graceDisabled.ctx), EXIT.failed, 'graceReviewRound: false blocks R5');
+  } finally { graceDisabled.cleanup(); }
+
+  // Astra #4: second task in the same slice cannot also spend a grace round when task A already used 5/4.
+  const taskAGrace = [
+    makeReceipt('105-a-r1.json', { task: '105-a', slice: 105, verdict: 'changes needed', counts: { important: 5, nit: 0, preExisting: 0 }, at: '2026-11-27T00:01:00Z' }),
+    makeReceipt('105-a-r2.json', { task: '105-a', slice: 105, verdict: 'changes needed', counts: { important: 3, nit: 0, preExisting: 0 }, at: '2026-11-27T00:02:00Z' }),
+    makeReceipt('105-a-r3.json', { task: '105-a', slice: 105, verdict: 'changes needed', counts: { important: 2, nit: 0, preExisting: 0 }, at: '2026-11-27T00:03:00Z' }),
+    makeReceipt('105-a-r4.json', { task: '105-a', slice: 105, verdict: 'changes needed', counts: { important: 1, nit: 0, preExisting: 0 }, at: '2026-11-27T00:04:00Z' }),
+    makeReceipt('105-a-r5.json', { task: '105-a', slice: 105, verdict: 'approve', counts: { important: 0, nit: 0, preExisting: 0 }, at: '2026-11-27T00:05:00Z' }),
+  ];
+  const secondGraceBlocked = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 12, maxTaskReviewRounds: 4, graceReviewRound: true },
+    baseReceipts: [...taskAGrace, ...convBase],
+    branchReceipts: convBranch,
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), secondGraceBlocked.ctx), EXIT.failed, 'second grace round in same slice is blocked');
+  } finally { secondGraceBlocked.cleanup(); }
+
+  // Astra #6 + R2.2: tampered receipt fails, while a valid refreshed moved-session copy for the same round passes regardless of sort order.
+  const tamperedGrace = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 12, maxTaskReviewRounds: 4, graceReviewRound: true },
+    baseReceipts: convBase,
+    branchReceipts: convBranch,
+  });
+  tamperedGrace.ctx.verifyReceiptRecord = () => false;
+  try {
+    assert.equal(mergePr(parseArgs(['55']), tamperedGrace.ctx), EXIT.failed, 'unverified receipt chain cannot unlock grace');
+  } finally { tamperedGrace.cleanup(); }
+
+  const refreshedMoved = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 12, maxTaskReviewRounds: 4, graceReviewRound: true },
+    baseReceipts: convBase,
+    branchReceipts: [
+      makeReceipt('105-g-r4-a-old.json', { task: '105-g', slice: 105, verdict: 'changes needed', counts: { important: 1, nit: 0, preExisting: 0 }, at: '2026-11-27T00:04:00Z' }),
+      makeReceipt('105-g-r4-z-moved.json', { task: '105-g', slice: 105, verdict: 'changes needed', counts: { important: 1, nit: 0, preExisting: 0 }, at: '2026-11-27T00:04:00Z' }),
+      convBranch[1],
+    ],
+  });
+  refreshedMoved.ctx.verifyReceiptRecord = (r) => !r.session.includes('105-g-r4-a-old');
+  try {
+    assert.equal(mergePr(parseArgs(['55']), refreshedMoved.ctx), EXIT.ok, 'valid moved-session copy passes even when older copy sorts first');
+  } finally { refreshedMoved.cleanup(); }
+
+  // Astra R2.3: non-slice branch carrying slice-tagged receipts still qualifies for converging grace.
+  const nonSliceGrace = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 4, maxTaskReviewRounds: 4, graceReviewRound: true },
+    baseReceipts: convBase,
+    branchReceipts: convBranch,
+    branchName: 'fix/related',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), nonSliceGrace.ctx), EXIT.ok, 'non-slice branch with slice-tagged receipts passes grace');
+  } finally { nonSliceGrace.cleanup(); }
+
+  // UniLex R1.2: two unrelated slices on a lead branch each qualify for their own slice grace round (5 + 5 = 10 <= 12).
+  const slice106Grace = [
+    makeReceipt('106-g-r1.json', { task: '106-g', slice: 106, verdict: 'changes needed', counts: { important: 6, nit: 0, preExisting: 0 }, at: '2026-11-27T01:01:00Z' }),
+    makeReceipt('106-g-r2.json', { task: '106-g', slice: 106, verdict: 'changes needed', counts: { important: 3, nit: 0, preExisting: 0 }, at: '2026-11-27T01:02:00Z' }),
+    makeReceipt('106-g-r3.json', { task: '106-g', slice: 106, verdict: 'changes needed', counts: { important: 2, nit: 0, preExisting: 0 }, at: '2026-11-27T01:03:00Z' }),
+    makeReceipt('106-g-r4.json', { task: '106-g', slice: 106, verdict: 'changes needed', counts: { important: 1, nit: 0, preExisting: 0 }, at: '2026-11-27T01:04:00Z' }),
+    makeReceipt('106-g-r5.json', { task: '106-g', slice: 106, verdict: 'approve', counts: { important: 0, nit: 0, preExisting: 0 }, at: '2026-11-27T01:05:00Z' }),
+  ];
+  const twoSlicesLead = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 12, maxTaskReviewRounds: 4, graceReviewRound: true },
+    baseReceipts: [],
+    branchReceipts: [...convBase, ...convBranch, ...slice106Grace],
+    branchName: 'lead/multi-slice',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), twoSlicesLead.ctx), EXIT.ok, 'two distinct slices on a lead branch do not share one grace budget');
+  } finally { twoSlicesLead.cleanup(); }
+});
+
+test('reviewCapsFromBase: disabling maxReviewRounds (0 or null) disables maxTaskReviewRounds when unset, matching receipt.mjs', () => {
+  assert.deepEqual(reviewCapsFromBase({}), { maxReviewRounds: 12, maxTaskReviewRounds: 4, graceReviewRound: true, extraReviewRoundSlices: [] });
+  assert.deepEqual(reviewCapsFromBase({ maxReviewRounds: 0 }), { maxReviewRounds: 0, maxTaskReviewRounds: null, graceReviewRound: true, extraReviewRoundSlices: [] });
+  assert.deepEqual(reviewCapsFromBase({ maxReviewRounds: null }), { maxReviewRounds: 0, maxTaskReviewRounds: null, graceReviewRound: true, extraReviewRoundSlices: [] });
+  assert.deepEqual(reviewCapsFromBase({ maxReviewRounds: 0, maxTaskReviewRounds: 3 }), { maxReviewRounds: 0, maxTaskReviewRounds: 3, graceReviewRound: true, extraReviewRoundSlices: [] });
+  assert.deepEqual(reviewCapsFromBase({ maxReviewRounds: 7, maxTaskReviewRounds: 0, graceReviewRound: false }), { maxReviewRounds: 7, maxTaskReviewRounds: null, graceReviewRound: false, extraReviewRoundSlices: [] });
+});
+
+test('review cap at merge time: unrelated slices with bare task "1" do not combine across slices and skip git show via baseReceiptSlicesFromGit', () => {
+  const earlierSlices = [101, 102, 103, 104, 105];
+  const branchReceipt = makeReceipt('106-task1.json', { task: '1', slice: 106, at: '2026-11-25T02:00:00Z' });
+  const baseCfg = { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4 };
+
+  // 1. Earlier slices landed via slice-named commits (legacy receipts without slice field): git show is skipped for them.
+  const byHistory = parallelReviewRepo({
+    baseConfig: baseCfg,
+    baseReceipts: [],
+    branchReceipts: [branchReceipt],
+    branchName: 'build/106-x',
+  });
+  try {
+    for (const sl of earlierSlices) {
+      byHistory.landOnMain({
+        receipts: [makeReceipt(`bare-${sl}.json`, { task: '1', slice: null, at: `2026-11-25T00:0${sl - 100}:00Z` })],
+        commitMessage: `Merge pull request #${sl} from build/${sl}-work`,
+      });
+    }
+    assert.equal(mergePr(parseArgs(['55']), byHistory.ctx), EXIT.ok);
+    const showedOther = byHistory.gitCalls.filter((c) => /^show origin\/main:docs\/receipts\/bare-\d+\.json$/.test(c));
+    assert.deepEqual(showedOther, [], 'base receipts from other slices are skipped without calling git show');
+  } finally { byHistory.cleanup(); }
+
+  // 2. Earlier slices committed under a generic subject with explicit slice fields still do not count toward slice 106.
+  const byField = parallelReviewRepo({
+    baseConfig: baseCfg,
+    baseReceipts: earlierSlices.map((sl) => makeReceipt(`slice-${sl}-task1.json`, {
+      task: '1',
+      slice: sl,
+      at: `2026-11-25T00:0${sl - 100}:00Z`,
+    })),
+    branchReceipts: [branchReceipt],
+    branchName: 'build/106-x',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), byField.ctx), EXIT.ok);
+  } finally { byField.cleanup(); }
+
+  // 3. A non-slice branch with bare task "1" counts only its own branch receipts and ignores other slices on base.
+  const nonSlice = parallelReviewRepo({
+    baseConfig: baseCfg,
+    baseReceipts: earlierSlices.map((sl) => makeReceipt(`slice-${sl}-task1.json`, {
+      task: '1',
+      slice: sl,
+      at: `2026-11-25T00:0${sl - 100}:00Z`,
+    })),
+    branchReceipts: [makeReceipt('misc-task1.json', { task: '1', slice: null, at: '2026-11-25T02:00:00Z' })],
+    branchName: 'lead/misc-fix',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), nonSlice.ctx), EXIT.ok);
+  } finally { nonSlice.cleanup(); }
+});
+
+test('review cap at merge time: base maxReviewRounds: 0 with unset maxTaskReviewRounds disables task cap too', () => {
+  const fiveRounds = Array.from({ length: 5 }, (_, i) => makeReceipt(`106-t1-r${i + 1}.json`, {
+    task: `106-t1-r${i + 1}`,
+    slice: 106,
+    at: `2026-11-25T01:0${i}:00Z`,
+  }));
+  const repo = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 0 },
+    baseReceipts: [],
+    branchReceipts: fiveRounds,
+    branchName: 'build/106-disabled',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), repo.ctx), EXIT.ok);
+  } finally { repo.cleanup(); }
+});
+
+test('review cap at merge time: branch name without slice number infers slice from branch receipts and enforces slice cap', () => {
+  const base7 = Array.from({ length: 7 }, (_, i) => makeReceipt(`105-t${Math.floor(i / 2) + 1}-r${i + 1}.json`, {
+    task: `105-t${Math.floor(i / 2) + 1}`,
+    slice: 105,
+    at: `2026-11-25T00:0${i}:00Z`,
+  }));
+  const followupReceipt = makeReceipt('105-t7-r8.json', {
+    task: '105-t7',
+    slice: null,
+    at: '2026-11-25T01:00:00Z',
+  });
+
+  // lead/followup has no slice number in branch name, but its receipt TASK "105-t7" maps to slice 105 (7 + 1 = 8 > 7).
+  const blocked = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 7, maxTaskReviewRounds: 4 },
+    baseReceipts: base7,
+    branchReceipts: [followupReceipt],
+    branchName: 'lead/followup',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), blocked.ctx), EXIT.failed);
+    assert.match(blocked.out.join('\n'), /FAIL {2}receipts: review round count \(8\) exceeds maxReviewRounds \(7\) across slice 105 \(REV-6\)\./);
+  } finally { blocked.cleanup(); }
+
+  // Base extraReviewRoundSlices: [105] waives the inferred slice on lead/followup too.
+  const waived = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 7, maxTaskReviewRounds: 4, extraReviewRoundSlices: [105] },
+    baseReceipts: base7,
+    branchReceipts: [followupReceipt],
+    branchName: 'lead/followup',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), waived.ctx), EXIT.ok);
+  } finally { waived.cleanup(); }
+});
+
+test('review cap at merge time (Opus N1): legacy bare task "1" merged under build/106-part1 combines with build/106-part2 and blocks at 5 > 4', () => {
+  const baseLegacy3 = Array.from({ length: 3 }, (_, i) => makeReceipt(`legacy-106-r${i + 1}.json`, {
+    task: '1',
+    slice: null,
+    at: `2026-11-25T00:0${i}:00Z`,
+  }));
+  const part2Branch2 = [
+    makeReceipt('part2-106-r4.json', { task: '1', slice: 106, at: '2026-11-25T01:00:00Z' }),
+    makeReceipt('part2-106-r5.json', { task: '1', slice: 106, at: '2026-11-25T01:05:00Z' }),
+  ];
+  const repo = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4 },
+    baseReceipts: [],
+    branchReceipts: part2Branch2,
+    branchName: 'build/106-part2',
+  });
+  try {
+    repo.landOnMain({
+      receipts: baseLegacy3,
+      commitMessage: 'Merge pull request #106 from build/106-part1',
+    });
+    assert.equal(mergePr(parseArgs(['55']), repo.ctx), EXIT.failed);
+    assert.match(repo.out.join('\n'), /FAIL {2}receipts: review round count \(5\) for task 1 exceeds maxTaskReviewRounds \(4\) \(REV-6\)\./);
+  } finally { repo.cleanup(); }
+});
+
+test('review cap at merge time (Astra #1): multi-slice non-slice branch counts bare task "1" separately per slice and merges base receipts only per slice', () => {
+  const slice105Rounds = Array.from({ length: 3 }, (_, i) => makeReceipt(`s105-t1-r${i + 1}.json`, {
+    task: '1',
+    slice: 105,
+    at: `2026-11-25T01:0${i}:00Z`,
+  }));
+  const slice106Rounds = Array.from({ length: 2 }, (_, i) => makeReceipt(`s106-t1-r${i + 1}.json`, {
+    task: '1',
+    slice: 106,
+    at: `2026-11-25T02:0${i}:00Z`,
+  }));
+  const baseCfg = { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4 };
+
+  // 3 rounds of (slice=105, task="1") + 2 rounds of (slice=106, task="1") stay within cap 4 each.
+  const separate = parallelReviewRepo({
+    baseConfig: baseCfg,
+    baseReceipts: [makeReceipt('base-105-t1-r0.json', { task: '1', slice: 105, at: '2026-11-25T00:00:00Z' })],
+    branchReceipts: [...slice105Rounds, ...slice106Rounds],
+    branchName: 'lead/followup',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), separate.ctx), EXIT.ok);
+  } finally { separate.cleanup(); }
+
+  // Adding 2 base receipts for slice 105 pushes (slice=105, task="1") to 5 > 4 and blocks.
+  const overOn105 = parallelReviewRepo({
+    baseConfig: baseCfg,
+    baseReceipts: [
+      makeReceipt('base-105-t1-r0a.json', { task: '1', slice: 105, at: '2026-11-25T00:00:00Z' }),
+      makeReceipt('base-105-t1-r0b.json', { task: '1', slice: 105, at: '2026-11-25T00:01:00Z' }),
+    ],
+    branchReceipts: [...slice105Rounds, ...slice106Rounds],
+    branchName: 'lead/followup',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), overOn105.ctx), EXIT.failed);
+    assert.match(overOn105.out.join('\n'), /FAIL {2}receipts: review round count \(5\) for task 1 exceeds maxTaskReviewRounds \(4\) \(REV-6\)\./);
+  } finally { overOn105.cleanup(); }
+});
+
+test('review cap at merge time (Astra #2): non-slice branch slice total counts only that slice on the branch, not another slice', () => {
+  const base9 = Array.from({ length: 9 }, (_, i) => makeReceipt(`105-t${Math.floor(i / 3) + 1}-r${i + 1}.json`, {
+    task: `105-t${Math.floor(i / 3) + 1}`,
+    slice: 105,
+    at: `2026-11-25T00:0${i}:00Z`,
+  }));
+  const branchReceipts = [
+    makeReceipt('105-t4-r10.json', { task: '105-t4', slice: 105, at: '2026-11-25T01:00:00Z' }),
+    makeReceipt('106-t1-r1.json', { task: '106-t1', slice: 106, at: '2026-11-25T01:05:00Z' }),
+  ];
+  const repo = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4 },
+    baseReceipts: base9,
+    branchReceipts,
+    branchName: 'lead/followup',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), repo.ctx), EXIT.ok);
+  } finally { repo.cleanup(); }
+});
+
+test('review cap at merge time (Astra #3): extraReviewRoundSlices waives only the exempt slice, still enforcing caps on unsliced and non-exempt receipts', () => {
+  const exempt105 = makeReceipt('105-t1-r1.json', { task: '105-t1', slice: 105, at: '2026-11-25T01:00:00Z' });
+  const unsliced5 = Array.from({ length: 5 }, (_, i) => makeReceipt(`misc-r${i + 1}.json`, {
+    task: 'misc-task',
+    slice: null,
+    at: `2026-11-25T02:0${i}:00Z`,
+  }));
+
+  // 1 exempt Slice 105 receipt + 5 rounds for an unsliced task -> blocked on unsliced task (5 > 4).
+  const blockedTask = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 10, maxTaskReviewRounds: 4, extraReviewRoundSlices: [105] },
+    baseReceipts: [],
+    branchReceipts: [exempt105, ...unsliced5],
+    branchName: 'lead/followup',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), blockedTask.ctx), EXIT.failed);
+    assert.match(blockedTask.out.join('\n'), /FAIL {2}receipts: review round count \(5\) for task misc-task exceeds maxTaskReviewRounds \(4\) \(REV-6\)\./);
+  } finally { blockedTask.cleanup(); }
+
+  // 1 exempt Slice 105 receipt + 8 unsliced rounds across tasks (within task cap 4) -> blocked by branch maxReviewRounds (8 > 7).
+  const unsliced8 = Array.from({ length: 8 }, (_, i) => makeReceipt(`misc-b${Math.floor(i / 4) + 1}-r${i + 1}.json`, {
+    task: `misc-b${Math.floor(i / 4) + 1}`,
+    slice: null,
+    at: `2026-11-25T03:0${i}:00Z`,
+  }));
+  const blockedBranch = parallelReviewRepo({
+    baseConfig: { checks: [], features: { reviewReceipts: 'enforce', events: true }, maxReviewRounds: 7, maxTaskReviewRounds: 4, extraReviewRoundSlices: [105] },
+    baseReceipts: [],
+    branchReceipts: [exempt105, ...unsliced8],
+    branchName: 'lead/followup',
+  });
+  try {
+    assert.equal(mergePr(parseArgs(['55']), blockedBranch.ctx), EXIT.failed);
+    assert.match(blockedBranch.out.join('\n'), /FAIL {2}receipts: review round count \(8\) exceeds maxReviewRounds \(7\) on this branch \(REV-6\)\./);
+  } finally { blockedBranch.cleanup(); }
+});
+
+// ---------- Kit 5.3.2: pull request product-size warning (maxPrProductLines) ----------
+
+// `git diff --numstat -z` output: each record ends in NUL; a rename is "<a>\t<d>\t", NUL, old, NUL, new, NUL.
+const SIZE_NUMSTAT = [
+  '400\t10\tapps/mobile/app/save.tsx',
+  '200\t0\tpackages/core/src/words.ts',
+  '900\t0\tapps/mobile/app/save.test.tsx',
+  '300\t0\tapps/mobile/__tests__/flow.tsx',
+  '250\t0\tpackages/core/src/words.spec.ts',
+  '500\t0\tdocs/plans/active/009-save.md',
+  '80\t0\tAGENTS.md',
+  '-\t-\tapps/mobile/assets/logo.png',
+  '60\t5\t', 'apps/mobile/old/rename.tsx', 'apps/mobile/app/rename.tsx',
+  '7\t1\tscripts/tool.mjs',
+].map((r) => `${r}\0`).join('');
+
+test('5.3.2 countPrProductAddedLines counts added product lines only: no tests, docs, paperwork, or binary files', () => {
+  const all = countPrProductAddedLines(SIZE_NUMSTAT);
+  assert.equal(all.lines, 400 + 200 + 60 + 7, 'with no productPaths every other file is product code');
+  assert.deepEqual(all.files, ['apps/mobile/app/save.tsx', 'packages/core/src/words.ts', 'apps/mobile/app/rename.tsx', 'scripts/tool.mjs']);
+  const scoped = countPrProductAddedLines(SIZE_NUMSTAT, { productPaths: ['apps/mobile/', 'packages/core'] });
+  assert.equal(scoped.lines, 400 + 200 + 60, 'scripts/ is outside productPaths');
+  // A folder named in paperworkPaths is left out, and docs/ always is (AGENTS.md counts once it is not paperwork).
+  assert.equal(countPrProductAddedLines(SIZE_NUMSTAT, { paperworkPaths: ['scripts/'] }).lines, 400 + 200 + 60 + 80);
+  assert.equal(countPrProductAddedLines('', {}).lines, 0);
+  assert.equal(countPrProductAddedLines('garbage line\0', {}).lines, 0);
+});
+
+test('5.3.2 parseNumstatZ reads raw paths: non-ASCII names, a literal " => " in a name, tabs, and renames', () => {
+  const z = (...records) => records.map((r) => `${r}\0`).join('');
+  const text = z('3\t0\tcafé/a.ts', '4\t1\tsrc/a => b.ts', '2\t0\tsrc/tab\there.ts', '5\t2\t', 'old/x.ts', 'new/café x.ts', '-\t-\timg/logo.png', '1\t0\tlast.ts');
+  assert.deepEqual(parseNumstatZ(text), [
+    { added: '3', deleted: '0', file: 'café/a.ts' },
+    { added: '4', deleted: '1', file: 'src/a => b.ts' },
+    { added: '2', deleted: '0', file: 'src/tab\there.ts' },
+    { added: '5', deleted: '2', file: 'new/café x.ts' },
+    { added: '-', deleted: '-', file: 'img/logo.png' },
+    { added: '1', deleted: '0', file: 'last.ts' },
+  ]);
+  const counted = countPrProductAddedLines(text, { productPaths: ['café/', 'src/', 'new/'] });
+  assert.deepEqual(counted.files, ['café/a.ts', 'src/a => b.ts', 'src/tab\there.ts', 'new/café x.ts']);
+  assert.equal(counted.lines, 3 + 4 + 2 + 5);
+});
+
+test('5.3.2 countPrProductAddedLines leaves out every testPaths file: tests/, test/, __snapshots__/, and a custom list', () => {
+  const z = (...records) => records.map((r) => `${r}\0`).join('');
+  const text = z('10\t0\tapps/web/tests/flow.ts', '20\t0\tapps/web/test/unit.ts', '30\t0\tapps/web/__snapshots__/a.snap', '40\t0\tapps/web/save.ts', '50\t0\tapps/web/checks/save.check.ts');
+  assert.deepEqual(countPrProductAddedLines(text).files, ['apps/web/save.ts', 'apps/web/checks/save.check.ts'], 'the default testPaths');
+  assert.deepEqual(countPrProductAddedLines(text, { testPaths: ['.check.'] }).files, ['apps/web/tests/flow.ts', 'apps/web/test/unit.ts', 'apps/web/__snapshots__/a.snap', 'apps/web/save.ts'], 'a custom list replaces the default');
+});
+
+test('5.3.2 the size warning uses the settings\' testPaths: a custom test folder does not count as product code', () => {
+  const numstat = '701\t0\tapps/mobile/save.ts\n900\t0\tapps/mobile/checks/save.ts\n';
+  const custom = { checks: CHECKS, testPaths: ['.test.', 'checks/'] };
+  const quiet = fakeMachine({ branch: 'build/003-save-word', files: ['apps/mobile/save.ts'], numstat: '600\t0\tapps/mobile/save.ts\n900\t0\tapps/mobile/checks/save.ts\n', config: custom, baseConfig: custom });
+  const loud = fakeMachine({ branch: 'build/003-save-word', files: ['apps/mobile/save.ts'], numstat, config: custom, baseConfig: custom });
+  try {
+    assert.equal(checkOnly(parseArgs(['--check']), quiet.ctx), EXIT.ok);
+    assert.ok(!quiet.calls.out.some((l) => l.startsWith('WARNING:')), quiet.calls.out.join('\n'));
+    assert.equal(checkOnly(parseArgs(['--check']), loud.ctx), EXIT.ok);
+    assert.equal(loud.calls.out.filter((l) => l.startsWith('WARNING: this pull request adds 701 lines')).length, 1, loud.calls.out.join('\n'));
+  } finally { quiet.cleanup(); loud.cleanup(); }
+});
+
+test('5.3.2 checkPrSizeWarning warns above the limit, is silent at or below it, and is off for null or 0', () => {
+  assert.equal(DEFAULT_MAX_PR_PRODUCT_LINES, 700);
+  assert.equal(settings({}).maxPrProductLines, 700);
+  assert.equal(settings({ maxPrProductLines: null }).maxPrProductLines, null);
+  assert.equal(settings({ maxPrProductLines: 0 }).maxPrProductLines, 0);
+  for (const bad of [-1, 1.5, '700', true]) assert.throws(() => settings({ maxPrProductLines: bad }), /"maxPrProductLines" must be/, String(bad));
+  const warning = checkPrSizeWarning({ lines: 701, max: 700 });
+  assert.match(warning, /^WARNING: this pull request adds 701 lines of product code \(maxPrProductLines is 700\)\. Split the task/);
+  assert.equal(checkPrSizeWarning({ lines: 700, max: 700 }), null);
+  assert.equal(checkPrSizeWarning({ lines: 10, max: 700 }), null);
+  assert.equal(checkPrSizeWarning({ lines: 5000, max: null }), null);
+  assert.equal(checkPrSizeWarning({ lines: 5000, max: 0 }), null);
+});
+
+test('5.3.2 --check, --check --fast, and the merge print the size warning and still pass', () => {
+  const big = '701\t0\tapps/mobile/save.ts\n900\t0\tapps/mobile/save.test.ts\n';
+  for (const args of [['--check'], ['--check', '--fast']]) {
+    const m = fakeMachine({ branch: 'build/003-save-word', files: ['apps/mobile/save.ts'], numstat: big });
+    try {
+      assert.equal(checkOnly(parseArgs(args), m.ctx), EXIT.ok);
+      assert.equal(m.calls.out.filter((l) => l.startsWith('WARNING: this pull request adds 701 lines')).length, 1, m.calls.out.join('\n'));
+    } finally { m.cleanup(); }
+  }
+  const merged = fakeMachine({ files: ['apps/mobile/save.ts'], numstat: big });
+  try {
+    assert.equal(merge(merged), EXIT.ok);
+    assert.equal(merged.calls.out.filter((l) => l.startsWith('WARNING: this pull request adds 701 lines')).length, 1, merged.calls.out.join('\n'));
+  } finally { merged.cleanup(); }
+});
+
+test('5.3.2 the size warning stays silent at the limit, when turned off, or when git cannot count', () => {
+  const atLimit = fakeMachine({ branch: 'build/003-save-word', files: ['apps/mobile/save.ts'], numstat: '700\t0\tapps/mobile/save.ts\n' });
+  const off = fakeMachine({ branch: 'build/003-save-word', files: ['apps/mobile/save.ts'], numstat: '5000\t0\tapps/mobile/save.ts\n', baseConfig: { checks: CHECKS, maxPrProductLines: 0 } });
+  const nulled = fakeMachine({ branch: 'build/003-save-word', files: ['apps/mobile/save.ts'], numstat: '5000\t0\tapps/mobile/save.ts\n', baseConfig: { checks: CHECKS, maxPrProductLines: null } });
+  const noGit = fakeMachine({ branch: 'build/003-save-word', files: ['apps/mobile/save.ts'] }); // fake git throws on numstat
+  for (const m of [atLimit, off, nulled, noGit]) {
+    try {
+      assert.equal(checkOnly(parseArgs(['--check']), m.ctx), EXIT.ok);
+      assert.ok(!m.calls.out.some((l) => l.startsWith('WARNING:')), m.calls.out.join('\n'));
+    } finally { m.cleanup(); }
+  }
 });

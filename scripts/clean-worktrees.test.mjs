@@ -94,6 +94,19 @@ test('options: defaults, environment, and flags (flags win); unknown options are
   assert.throws(() => parseArgs(['--fetch', '--no-fetch']), /not both/);
 });
 
+test('--ignore-pid: repeatable, defaults to none, and refuses anything but a whole number above 0', () => {
+  assert.deepEqual(parseArgs([]).ignorePids, []);
+  assert.deepEqual(parseArgs(['--ignore-pid', '42', '--ignore-pid', '7']).ignorePids, [42, 7]);
+  for (const bad of ['0', '-3', '1.5', 'abc', '12x', ' 4', '99999999999999999999']) {
+    assert.throws(() => parseArgs(['--ignore-pid', bad]), /--ignore-pid must be a program id/, bad);
+  }
+  assert.throws(() => parseArgs(['--ignore-pid']), /needs a value/);
+  assert.throws(() => parseArgs(['--ignore-pid', '--delete']), /needs a value/);
+  const r = spawnSync(process.execPath, [SCRIPT, '--ignore-pid', 'nope'], { encoding: 'utf8' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /--ignore-pid must be a program id/);
+});
+
 test('parses git worktree list output, including locks and detached heads', () => {
   const list = parseWorktreeList('worktree /repo\nHEAD aaa\nbranch refs/heads/main\n\nworktree /wt/one\nHEAD bbb\nbranch refs/heads/build/001-x\nlocked kept on purpose\n\nworktree /wt/two\nHEAD ccc\ndetached\n');
   assert.deepEqual(list.map((e) => [e.path, e.branch, e.locked]), [['/repo', 'main', false], ['/wt/one', 'build/001-x', true], ['/wt/two', null, false]]);
@@ -102,6 +115,10 @@ test('parses git worktree list output, including locks and detached heads', () =
 test('finds programs with a working folder or an open file inside a worktree, not in a look-alike folder', () => {
   const procs = parseLsof('p10\ncnode\nfcwd\nn/wt/one\np11\nczsh\nfcwd\nn/home\nf3\nn/wt/one/src/a.ts\np12\ncvim\nfcwd\nn/wt/one-b\np13\ncbash\nfcwd\nn/\n');
   assert.deepEqual(processesIn('/wt/one', procs).map((p) => [p.pid, p.command]), [[10, 'node'], [11, 'zsh']]);
+  assert.deepEqual(processesIn('/wt/one', procs, new Set([10])).map((p) => p.pid), [11], 'an ignored program id is left out');
+  assert.deepEqual(processesIn('/wt/one', procs, new Set([10, 11])), []);
+  // Ignoring a program never hides the script itself from the lsof sanity check.
+  assert.match(lsofProblem('p1\ncnode\nfcwd\nn/\n', '', 7), /did not list this script/);
 });
 
 test('treats an lsof warning or partial output as unknown', () => {
@@ -894,4 +911,39 @@ exec "${realGit}" "$@"
     assert.match(r.stdout, /not removed: it was checked again just before removal:.*its branch or commit changed since the first check/);
     assert.ok(existsSync(wtPath), 'worktree is kept when its branch switched at the same commit');
   } finally { s.cleanup(); }
+});
+
+test('--ignore-pid lets the just-merged worktree go while the merge runs in it, but only that program, and only on --merged-branch', async () => {
+  const s = sandbox();
+  const kids = [];
+  const sit = async (cwd) => {
+    const c = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { cwd, stdio: 'ignore' });
+    kids.push(c);
+    await new Promise((r) => c.once('spawn', r));
+    return c;
+  };
+  try {
+    const { sh, repo, wt, commitIn, base } = s;
+    const merged = wt(join(base, 'merged'), ['-b', 'lead/000-foundation']);
+    commitIn(merged, 'm.txt'); sh(['push', '-q', 'origin', 'HEAD:main'], merged); sh(['fetch', '-q', 'origin'], repo);
+    const crowded = wt(join(base, 'crowded'), ['-b', 'build/001-crowded']);
+    const other = wt(join(base, 'other'), ['--detach']);
+    const merger = await sit(merged); // stands in for merge-pr.mjs running inside the merged worktree
+    const stranger = await sit(crowded); // ignored, but crowded also has a program that is not
+    const helper = await sit(crowded);
+    const outsider = await sit(other); // ignored, but other is not on a --merged-branch
+    const r = s.run(['--delete', '--merged-branch', 'lead/000-foundation', '--merged-branch', 'build/001-crowded',
+      '--ignore-pid', String(merger.pid), '--ignore-pid', String(stranger.pid), '--ignore-pid', String(outsider.pid)]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(existsSync(merged), false, 'the just-merged worktree is removed though the ignored program sits in it');
+    assert.match(r.stdout, /Removed 1 worktrees/);
+    assert.match(verdictFor(r.stdout, crowded), new RegExp(`kept: a program is using it \\(node, pid ${helper.pid}\\)`));
+    assert.ok(existsSync(crowded), 'another program still keeps a merged-branch worktree');
+    assert.match(verdictFor(r.stdout, other), new RegExp(`kept: a program is using it \\(node, pid ${outsider.pid}\\)`));
+    assert.ok(existsSync(other), '--ignore-pid does not count for a worktree off --merged-branch');
+    assert.match(verdictFor(r.stdout, repo), /kept: it is the main checkout/);
+  } finally {
+    for (const k of kids) k.kill();
+    s.cleanup();
+  }
 });

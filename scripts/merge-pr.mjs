@@ -28,7 +28,8 @@
 //       The merge ritual for one pull request. Be on that pull request's branch (or a local
 //       branch that holds it), with nothing unsaved. --ready also marks a draft ready to merge.
 //       After GitHub confirms the merge, runs scripts/clean-worktrees.mjs --delete for the merged
-//       branch unless --no-clean is passed (best-effort; never fails the merge).
+//       branch unless --no-clean is passed (best-effort; never fails the merge). The cleanup runs
+//       from the main checkout, so a merge run from inside the merged worktree can still remove it.
 //   node scripts/merge-pr.mjs --check [--fast] [--no-cache] [--who <name>] [--wait <seconds>]
 //       Run the checks for the current branch only: no merge of the base branch, no push, no
 //       comment, no merge. --fast is the quick check: it skips the checks marked "slot": true (the
@@ -64,6 +65,12 @@
 //                        has "slot": true and the test slot is busy, it is left out with one line.
 //                        A branch cannot move a check to "observe" for its own merge while the base
 //                        branch still enforces that check: it enforces, and one line says so.
+//   maxPrProductLines    most lines of product code a pull request may add before a "WARNING:" line asks
+//                        the head agent to split it (default 700; null or 0 turns it off). Product code:
+//                        a file in productPaths (any file when that list is empty) that is not paperwork,
+//                        not in docs/, and not a test (by testPaths). Binary files do
+//                        not count. Printed by --check (also with --fast) and by the merge; it never stops
+//                        either one, and never changes the exit code.
 //   highRiskPaths        folders (ending in "/") and files where a mistake costs the most (sign-in,
 //                        money, data deletion). A change that touches one is labelled "high" risk: the
 //                        label and the entries that matched go in the pull request comment and in the
@@ -263,6 +270,12 @@ export const LEVEL_ORDER = Object.freeze(['quick', 'standard', 'deep']);
 export const VERIFIED_REASON_MIN = 15;
 // The retry cap: this many failed runs of one check in a row on one branch parks the slice.
 export const RETRY_CAP = 3;
+const DEFAULT_MAX_PRS_PER_THREAD = 2;
+const DEFAULT_MAX_TASKS_PER_THREAD = 2;
+const DEFAULT_MAX_REVIEW_ROUNDS = 12;
+const DEFAULT_MAX_TASK_REVIEW_ROUNDS = 4;
+const DEFAULT_GRACE_REVIEW_ROUND = true;
+const RECEIPT_DIR = 'docs/receipts/';
 export const API_MARKER = 'CHECKER_API';
 export const INCOMING = 'incoming commits';
 export const RESERVED_NAMES = ['rules', 'kit tests', 'script tests', INCOMING];
@@ -328,6 +341,10 @@ export function modeOf(value) {
 // The stricter of two modes: enforce over observe over off.
 export const stricter = (a, b) => MODES[Math.max(MODES.indexOf(a), MODES.indexOf(b))];
 
+// The pull request size warning (maxPrProductLines): above this many added lines of product code, the
+// check and the merge print one WARNING line. It never stops anything.
+export const DEFAULT_MAX_PR_PRODUCT_LINES = 700;
+
 // Fills in defaults for the settings this script uses, and fails loud on a bad "checks" list.
 // features[name] says whether a gate runs at all (true for "observe" and "enforce"); modes[name] says how.
 export function settings(config = {}) {
@@ -348,8 +365,12 @@ export function settings(config = {}) {
     plansDir: config.plansDir ?? 'docs/plans',
     buildPrefix: config.buildPrefix ?? 'build/',
     productPaths: config.productPaths ?? [],
+    maxPrProductLines: config.maxPrProductLines === undefined ? DEFAULT_MAX_PR_PRODUCT_LINES : config.maxPrProductLines,
     modes: {},
   };
+  if (out.maxPrProductLines !== null && (!Number.isInteger(out.maxPrProductLines) || out.maxPrProductLines < 0)) {
+    throw new Error('settings: "maxPrProductLines" must be a whole number of lines, 0 or more, or null (0 and null turn the warning off)');
+  }
   for (const key of ['leadPrefixes', 'paperworkPaths', 'checks', 'numberedPaths', 'testPaths', 'highRiskPaths', 'presets', 'checkSettingsPaths', 'snapshotPaths', 'productPaths']) {
     if (!Array.isArray(out[key])) throw new Error(`settings: "${key}" must be a list`);
   }
@@ -864,7 +885,8 @@ function pickChecker({ lead, baseRef }, ctx) {
 // Decides whose settings to trust. The base branch's settings say which branches are lead
 // branches. A lead branch then uses the worktree's settings (the head agent may change them);
 // any other branch uses the base branch's settings for everything.
-// Returns { lead, cfg, base }: cfg is the settings to use, base is the base branch's own.
+// Returns { lead, cfg, base, baseRaw }: cfg is the settings to use, base is the base branch's own,
+// baseRaw is the parsed raw JSON object from the base branch (for fields like maxReviewRounds).
 // Throws with a plain message when the settings cannot be trusted.
 function pickSettings({ branch, base, baseRef, checkBase = false }, ctx) {
   const shown = ctx.git(['show', `${baseRef}:${ctx.configFile ?? CONFIG_FILE}`]);
@@ -873,6 +895,15 @@ function pickSettings({ branch, base, baseRef, checkBase = false }, ctx) {
     trusted = (ctx.parseSettings ?? parseSettingsText)(shown.code === 0 ? shown.stdout : null);
   } catch (e) {
     throw new Error(`The settings on ${baseRef} cannot be read: ${e.message}`);
+  }
+  let baseRaw = {};
+  if (shown.code === 0) {
+    try {
+      const parsed = JSON.parse(shown.stdout);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) baseRaw = parsed;
+    } catch {
+      // parseSettings already checked the base settings; keep empty defaults if a stub did not pass JSON.
+    }
   }
   const lead = isLeadBranch(branch, base, trusted.leadPrefixes);
   if (lead) {
@@ -884,7 +915,7 @@ function pickSettings({ branch, base, baseRef, checkBase = false }, ctx) {
         throw new Error(`The settings in this folder cannot be read: ${e.message}`);
       }
     }
-    return { lead, cfg: own, base: trusted };
+    return { lead, cfg: own, base: trusted, baseRaw };
   }
   // The remote (and, with no pull request, the base branch) came from this folder's settings to
   // find the base at all. Only a lead branch may change them.
@@ -892,7 +923,7 @@ function pickSettings({ branch, base, baseRef, checkBase = false }, ctx) {
   if (trusted.remote !== ctx.config.remote) changed.push(`"remote" (${ctx.config.remote} here, ${trusted.remote} on ${baseRef})`);
   if (checkBase && trusted.baseBranch !== ctx.config.baseBranch) changed.push(`"baseBranch" (${ctx.config.baseBranch} here, ${trusted.baseBranch} on ${baseRef})`);
   if (changed.length) throw new Error(`This branch's settings change ${changed.join(' and ')}. Only a lead branch may change settings.`);
-  return { lead, cfg: trusted, base: trusted };
+  return { lead, cfg: trusted, base: trusted, baseRaw };
 }
 
 // Runs the planned checks in order and stops at the first failure of a check that is not on "observe".
@@ -1058,10 +1089,425 @@ function numberClash(numberedPaths, ctx) {
     ...found.map((d) => `  ${d.folder} ${d.number}: ${d.files.join(', ')}`)].join('\n');
 }
 
+// Reads base review-round cap settings from the base branch's raw kit.config.json object.
+// Only base settings count, so a branch cannot raise or waive its own cap.
+// Matches resolveMaxTaskReviewRounds in receipt.mjs: when base explicitly sets maxReviewRounds
+// to 0 or null and leaves maxTaskReviewRounds unset, maxTaskReviewRounds is disabled (null) too.
+export function reviewCapsFromBase(baseRaw = {}, { maxRoundsDefault = DEFAULT_MAX_REVIEW_ROUNDS, maxTaskRoundsDefault = DEFAULT_MAX_TASK_REVIEW_ROUNDS, graceDefault = DEFAULT_GRACE_REVIEW_ROUND } = {}) {
+  const raw = baseRaw && typeof baseRaw === 'object' ? baseRaw : {};
+  let maxReviewRounds = maxRoundsDefault;
+  if (Object.hasOwn(raw, 'maxReviewRounds')) {
+    const v = raw.maxReviewRounds;
+    if (v === 0 || v === null) maxReviewRounds = 0;
+    else if (Number.isInteger(v) && v > 0) maxReviewRounds = v;
+  }
+  const hasTaskCap = Object.hasOwn(raw, 'maxTaskReviewRounds');
+  let maxTaskReviewRounds = !hasTaskCap && maxReviewRounds === 0 ? null : maxTaskRoundsDefault;
+  if (hasTaskCap) {
+    const v = raw.maxTaskReviewRounds;
+    if (v === 0 || v === null) maxTaskReviewRounds = null;
+    else if (Number.isInteger(v) && v > 0) maxTaskReviewRounds = v;
+  }
+  const graceReviewRound = Object.hasOwn(raw, 'graceReviewRound') && raw.graceReviewRound === false ? false : graceDefault;
+  const extraReviewRoundSlices = Array.isArray(raw.extraReviewRoundSlices) ? raw.extraReviewRoundSlices : [];
+  return { maxReviewRounds, maxTaskReviewRounds, graceReviewRound, extraReviewRoundSlices };
+}
+
+function receiptRoundKey(receipt, path, roundKeyFn) {
+  if (roundKeyFn) {
+    const k = roundKeyFn(receipt);
+    if (k) return k;
+  }
+  if (receipt && typeof receipt.task === 'string' && receipt.task) {
+    if (typeof receipt.at === 'string' && receipt.at) {
+      return `round:${receipt.task}|${receipt.at}|${typeof receipt.model === 'string' ? receipt.model : ''}`;
+    }
+    return `task:${receipt.task}`;
+  }
+  return `path:${path}`;
+}
+
+function normalizeTaskKey(task, normalizeFn) {
+  if (typeof task !== 'string') return '';
+  if (normalizeFn) {
+    const n = normalizeFn(task);
+    return typeof n === 'string' ? n : '';
+  }
+  const trimmed = task.trim();
+  if (!trimmed) return '';
+  const stripped = trimmed.replace(/(?:[-_.]r(?:ound)?[-_]?\d+)+$/i, '');
+  return stripped || trimmed;
+}
+
+function resolveReceiptSlice(parsed, receiptSliceOfFn) {
+  if (typeof receiptSliceOfFn === 'function') return receiptSliceOfFn(parsed);
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (Number.isInteger(parsed.slice)) return parsed.slice;
+  if (typeof parsed.branch === 'string') {
+    const m = parsed.branch.match(/(?:^|\/)(\d{3})(?=-|$)/);
+    if (m) return Number(m[1]);
+  }
+  if (typeof parsed.task === 'string') {
+    const m = parsed.task.match(/(?:^|[-/])(\d{3})(?=-|$)/);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+// Reads every receipt file added on this branch since baseRef (at HEAD).
+// Returns { entries: [{ path, receipt }] } or { fail }.
+function readBranchAddedReceipts(baseRef, ctx) {
+  const fork = ctx.git(['merge-base', baseRef, 'HEAD']);
+  if (fork.code !== 0 || !fork.stdout.trim()) {
+    return { fail: `cannot find where HEAD left ${baseRef}: ${(fork.stderr || 'no common commit').trim()}` };
+  }
+  const added = ctx.git(['diff', '--name-only', '-z', '--no-renames', '--diff-filter=A', fork.stdout.trim(), 'HEAD', '--', RECEIPT_DIR]);
+  if (added.code !== 0) {
+    return { fail: `cannot list receipts after ${baseRef}: ${added.stderr.trim()}` };
+  }
+  const entries = [];
+  for (const p of splitZ(added.stdout).filter((f) => f.endsWith('.json'))) {
+    const shown = ctx.git(['show', `HEAD:${p}`]);
+    if (shown.code !== 0) return { fail: `cannot read receipt ${p}: ${(shown.stderr || 'git show failed').trim()}` };
+    let parsed;
+    try {
+      parsed = JSON.parse(shown.stdout);
+    } catch (e) {
+      return { fail: `receipt ${p} is not valid JSON: ${e.message}` };
+    }
+    entries.push({ path: p, receipt: parsed });
+  }
+  return { entries };
+}
+
+// Lists tasks touched by receipts added on this branch since baseRef (at HEAD) and counts their
+// distinct review rounds across this branch and same-slice receipts on baseRef so parallel
+// branches reviewing the same task (including round-suffixed task ids like -r1/-r2) cannot exceed
+// maxTaskReviewRounds while unrelated slices' bare task ids (like "1") never mix. Buckets are
+// keyed per (slice, task) so multi-slice non-slice branches never pool bare task ids across slices.
+// Un-sliced receipts (slice === null) count only un-sliced receipts on this branch.
+function readTaskRoundsForCap(baseRef, { branchSlice: targetBranchSlice = null, entries = null, waivedSlices = [] } = {}, ctx) {
+  let addedEntries = entries;
+  if (!addedEntries) {
+    const read = readBranchAddedReceipts(baseRef, ctx);
+    if (read.fail) return { fail: read.fail };
+    addedEntries = read.entries;
+  }
+  const waived = new Set(waivedSlices);
+  const byTask = new Map(); // "<slice|none>:<lowercase normalized task>" -> { label, slice, rounds: Set, receipts: Map, branchRoundKeys: Set }
+  const allTasksBySlice = new Map(); // slice -> Map<lowercase norm, bucket>
+  const getSliceMap = (s) => {
+    if (!allTasksBySlice.has(s)) allTasksBySlice.set(s, new Map());
+    return allTasksBySlice.get(s);
+  };
+  const wantedSlices = new Set();
+  for (const { path: p, receipt: parsed } of addedEntries) {
+    const norm = normalizeTaskKey(parsed?.task, ctx.normalizeTaskId);
+    if (!norm) continue;
+    const receiptSlice = targetBranchSlice !== null ? targetBranchSlice : resolveReceiptSlice(parsed, ctx.receiptSliceOf);
+    if (receiptSlice !== null && waived.has(receiptSlice)) continue;
+    const normKey = norm.toLowerCase();
+    const key = `${receiptSlice ?? 'none'}:${normKey}`;
+    if (!byTask.has(key)) byTask.set(key, { label: norm, slice: receiptSlice, rounds: new Set(), receipts: new Map(), receiptCopies: new Map(), branchRoundKeys: new Set() });
+    const bucket = byTask.get(key);
+    const rk = receiptRoundKey(parsed, p, ctx.roundKey);
+    bucket.rounds.add(rk);
+    bucket.branchRoundKeys.add(rk);
+    if (!bucket.receipts.has(rk)) bucket.receipts.set(rk, parsed);
+    if (!bucket.receiptCopies.has(rk)) bucket.receiptCopies.set(rk, []);
+    bucket.receiptCopies.get(rk).push(parsed);
+    if (receiptSlice !== null) {
+      wantedSlices.add(receiptSlice);
+      getSliceMap(receiptSlice).set(normKey, bucket);
+    }
+  }
+  const hasUnsliced = [...byTask.values()].some((b) => b.slice === null);
+  if (byTask.size > 0 && (wantedSlices.size > 0 || hasUnsliced)) {
+    const listed = ctx.git(['ls-tree', '-r', '-z', '--name-only', baseRef, '--', RECEIPT_DIR]);
+    if (listed.code !== 0) {
+      return { fail: `cannot list ${RECEIPT_DIR} on ${baseRef}: ${listed.stderr.trim()}` };
+    }
+    const basePaths = splitZ(listed.stdout).filter((f) => f.endsWith('.json'));
+    const historySlices = basePaths.length && typeof ctx.baseReceiptSlicesFromGit === 'function'
+      ? ctx.baseReceiptSlicesFromGit(baseRef, ctx.git, basePaths)
+      : new Map();
+    for (const p of basePaths) {
+      const historySlice = historySlices.has(p) ? historySlices.get(p) : null;
+      if (historySlice !== null && !wantedSlices.has(historySlice)) continue;
+      if (historySlice === null && wantedSlices.size === 0 && !hasUnsliced) continue;
+      const shown = ctx.git(['show', `${baseRef}:${p}`]);
+      if (shown.code !== 0) return { fail: `cannot read receipt ${p} on ${baseRef}: ${(shown.stderr || 'git show failed').trim()}` };
+      let parsed;
+      try {
+        parsed = JSON.parse(shown.stdout);
+      } catch (e) {
+        return { fail: `receipt ${p} on ${baseRef} is not valid JSON: ${e.message}` };
+      }
+      const baseSlice = historySlice !== null ? historySlice : resolveReceiptSlice(parsed, ctx.receiptSliceOf);
+      const norm = normalizeTaskKey(parsed?.task, ctx.normalizeTaskId);
+      if (!norm) continue;
+      const normKey = norm.toLowerCase();
+      const rk = receiptRoundKey(parsed, p, ctx.roundKey);
+      if (baseSlice === null) {
+        const unslicedBucket = byTask.get(`none:${normKey}`);
+        if (unslicedBucket) unslicedBucket.branchRoundKeys.delete(rk);
+        continue;
+      }
+      if (!wantedSlices.has(baseSlice)) continue;
+      const sliceMap = getSliceMap(baseSlice);
+      let bucket = sliceMap.get(normKey);
+      if (!bucket) {
+        bucket = { label: norm, slice: baseSlice, rounds: new Set(), receipts: new Map(), receiptCopies: new Map(), branchRoundKeys: new Set() };
+        sliceMap.set(normKey, bucket);
+      }
+      bucket.rounds.add(rk);
+      // A round already present on baseRef is NOT new to this branch even if a refreshed copy was added here.
+      bucket.branchRoundKeys.delete(rk);
+      if (!bucket.receipts.has(rk)) bucket.receipts.set(rk, parsed);
+      if (!bucket.receiptCopies.has(rk)) bucket.receiptCopies.set(rk, []);
+      bucket.receiptCopies.get(rk).push(parsed);
+    }
+  }
+  return { byTask, allTasksBySlice };
+}
+
+// Merge-time REV-6 review-round brake: catches parallel branches that each stayed within the cap
+// at receipt.mjs make time, but exceed maxReviewRounds or maxTaskReviewRounds once combined with
+// baseRef at merge time. Skips gracefully when receipt counting helpers are absent in stubbed ctx.
+function checkReviewCaps({ baseRef, branch, buildPrefix, baseRaw }, ctx) {
+  const hasSliceCounter = typeof ctx.countSliceReceipts === 'function';
+  const hasBranchCounter = typeof ctx.countBranchReceipts === 'function';
+  const hasTaskCounter = typeof ctx.countTaskReceipts === 'function';
+  if (!hasSliceCounter && !hasBranchCounter && !hasTaskCounter) return null;
+
+  const caps = reviewCapsFromBase(baseRaw, {
+    maxRoundsDefault: ctx.defaultMaxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS,
+    maxTaskRoundsDefault: ctx.defaultMaxTaskReviewRounds ?? DEFAULT_MAX_TASK_REVIEW_ROUNDS,
+    graceDefault: ctx.defaultGraceReviewRound ?? DEFAULT_GRACE_REVIEW_ROUND,
+  });
+  const checkSliceCap = caps.maxReviewRounds > 0 && (hasSliceCounter || hasBranchCounter);
+  const checkTaskCap = caps.maxTaskReviewRounds !== null && caps.maxTaskReviewRounds > 0 && hasTaskCounter;
+  if (!checkSliceCap && !checkTaskCap) return null;
+
+  const waived = new Set(caps.extraReviewRoundSlices);
+  const branchSliceNum = mergeBranchSlice(branch, buildPrefix, ctx.branchSlice);
+  if (branchSliceNum !== null && waived.has(branchSliceNum)) return null;
+
+  let cachedEntries = null;
+  const getBranchEntries = () => {
+    if (cachedEntries === null) cachedEntries = readBranchAddedReceipts(baseRef, ctx);
+    return cachedEntries;
+  };
+  let cachedTaskRounds = null;
+  const getTaskRounds = () => {
+    if (cachedTaskRounds === null) {
+      const read = getBranchEntries();
+      if (read.fail) cachedTaskRounds = { fail: read.fail };
+      else {
+        cachedTaskRounds = readTaskRoundsForCap(
+          baseRef,
+          { branchSlice: branchSliceNum, entries: read.entries, waivedSlices: caps.extraReviewRoundSlices },
+          ctx,
+        );
+      }
+    }
+    return cachedTaskRounds;
+  };
+  const taskPassedGrace = (bucket, { effectiveSliceCount = null, priorGraceUsed = false } = {}) => {
+    if (!caps.graceReviewRound || typeof ctx.evaluateGraceRound !== 'function') return false;
+    const entries = [...bucket.receipts.entries()]
+      .map(([rk, r], i) => ({ rk, r, i, ts: Date.parse(r?.at) || 0 }))
+      .sort((a, b) => (a.ts !== b.ts ? a.ts - b.ts : a.i - b.i));
+    if (entries.length < 2) return false;
+    const last = entries[entries.length - 1];
+    if (last.r?.verdict !== 'approve') return false;
+    // Only a round actually added on this branch may spend grace (never an old merged approval).
+    if (!bucket.branchRoundKeys?.has(last.rk)) return false;
+    // When session verification is available (real merges), pick and evaluate the verified copy
+    // for every round so filename sort order cannot change the verdict or let a tampered copy pass.
+    let list;
+    if (typeof ctx.verifyReceiptRecord === 'function') {
+      list = [];
+      for (const { rk, r } of entries) {
+        const copies = bucket.receiptCopies?.get(rk) ?? [r];
+        const verified = copies.find((copy) => ctx.verifyReceiptRecord(copy));
+        if (!verified) return false;
+        list.push(verified);
+      }
+      if (list[list.length - 1]?.verdict !== 'approve') return false;
+    } else {
+      list = entries.map((x) => x.r);
+    }
+    return ctx.evaluateGraceRound(list.slice(0, -1), {
+      maxTaskRounds: caps.maxTaskReviewRounds,
+      maxRounds: caps.maxReviewRounds,
+      taskRound: list.length,
+      effectiveRound: effectiveSliceCount ?? list.length,
+      priorGraceUsed,
+    }).allowed;
+  };
+  const otherTaskUsedGrace = (tr, bucket) => {
+    if (caps.maxTaskReviewRounds === null) return false;
+    const peers = bucket.slice !== null && tr.allTasksBySlice?.has(bucket.slice)
+      ? [...tr.allTasksBySlice.get(bucket.slice).values()]
+      : [...tr.byTask.values()].filter((b) => b.slice === null);
+    return peers.some((p) => p !== bucket && p.rounds.size > caps.maxTaskReviewRounds);
+  };
+  const extraRoundBucketForSlice = (tr, targetSlice) => {
+    const peers = targetSlice !== null && tr.allTasksBySlice?.has(targetSlice)
+      ? [...tr.allTasksBySlice.get(targetSlice).values()]
+      : [...tr.byTask.values()];
+    if (!peers.length) return { ok: false };
+    const overTask = caps.maxTaskReviewRounds !== null
+      ? peers.filter((b) => b.rounds.size > caps.maxTaskReviewRounds)
+      : [];
+    if (overTask.length > 1) return { ok: false };
+    // Find the chronologically latest receipt across the slice (the actual extra round).
+    let latest = null;
+    for (const b of peers) {
+      for (const [rk, r] of b.receipts.entries()) {
+        const ts = Date.parse(r?.at) || 0;
+        const onBranch = b.branchRoundKeys?.has(rk) ? 1 : 0;
+        if (!latest || ts > latest.ts || (ts === latest.ts && onBranch > latest.onBranch)) {
+          latest = { bucket: b, rk, ts, onBranch };
+        }
+      }
+    }
+    if (!latest || !latest.onBranch) return { ok: false };
+    if (overTask.length === 1 && overTask[0] !== latest.bucket) return { ok: false };
+    return { ok: true, bucket: latest.bucket };
+  };
+
+  let slices = branchSliceNum !== null ? [branchSliceNum] : [];
+  if (branchSliceNum === null) {
+    const read = getBranchEntries();
+    if (read.fail) return { code: EXIT.failed, text: `FAIL  receipts: cannot count review rounds: ${read.fail}` };
+    const inferred = new Set();
+    for (const { receipt } of read.entries) {
+      const s = resolveReceiptSlice(receipt, ctx.receiptSliceOf);
+      if (s !== null) inferred.add(s);
+    }
+    slices = [...inferred].sort((a, b) => a - b);
+  }
+
+  if (checkSliceCap) {
+    let branchCount = 0;
+    if (hasBranchCounter) {
+      if (branchSliceNum !== null) {
+        const counted = ctx.countBranchReceipts({ baseRef, tip: 'HEAD', git: ctx.git, root: ctx.root, includeWorkingTree: false });
+        if (counted?.fail) return { code: EXIT.failed, text: `FAIL  receipts: cannot count review rounds: ${counted.fail}` };
+        branchCount = counted?.count ?? 0;
+      } else {
+        const read = getBranchEntries();
+        if (read.fail) return { code: EXIT.failed, text: `FAIL  receipts: cannot count review rounds: ${read.fail}` };
+        const nonExemptRounds = new Set();
+        for (const { path: p, receipt } of read.entries) {
+          const s = resolveReceiptSlice(receipt, ctx.receiptSliceOf);
+          if (s !== null && waived.has(s)) continue;
+          nonExemptRounds.add(receiptRoundKey(receipt, p, ctx.roundKey));
+        }
+        branchCount = nonExemptRounds.size;
+      }
+    }
+    const overSlices = [];
+    if (hasSliceCounter) {
+      const filterBranchBySlice = branchSliceNum === null;
+      for (const s of slices) {
+        if (waived.has(s)) continue;
+        const counted = ctx.countSliceReceipts({ baseRef, tip: 'HEAD', slice: s, git: ctx.git, root: ctx.root, includeWorkingTree: false, filterBranchBySlice });
+        if (counted?.fail) return { code: EXIT.failed, text: `FAIL  receipts: cannot count review rounds: ${counted.fail}` };
+        const c = counted?.count ?? 0;
+        if (c > caps.maxReviewRounds) overSlices.push({ slice: s, count: c });
+      }
+    }
+    for (const { slice: s, count: c } of overSlices) {
+      let ok = false;
+      if (caps.graceReviewRound && c === caps.maxReviewRounds + 1 && typeof ctx.evaluateGraceRound === 'function') {
+        const tr = getTaskRounds();
+        if (!tr.fail && tr.byTask) {
+          const picked = extraRoundBucketForSlice(tr, s);
+          if (picked.ok) {
+            ok = taskPassedGrace(picked.bucket, {
+              effectiveSliceCount: c,
+              priorGraceUsed: otherTaskUsedGrace(tr, picked.bucket),
+            });
+          }
+        }
+      }
+      if (!ok) {
+        return {
+          code: EXIT.failed,
+          refused: true,
+          text: [
+            `FAIL  receipts: review round count (${c}) exceeds maxReviewRounds (${caps.maxReviewRounds}) across slice ${String(s).padStart(3, '0')} (REV-6).`,
+            'Park this branch or add the slice to extraReviewRoundSlices on the base branch, then run this again.',
+          ].join('\n'),
+        };
+      }
+    }
+    if (branchCount > caps.maxReviewRounds) {
+      let ok = false;
+      if (caps.graceReviewRound && branchCount === caps.maxReviewRounds + 1 && typeof ctx.evaluateGraceRound === 'function') {
+        const tr = getTaskRounds();
+        if (!tr.fail && tr.byTask) {
+          const picked = extraRoundBucketForSlice(tr, branchSliceNum);
+          if (picked.ok) {
+            ok = taskPassedGrace(picked.bucket, {
+              effectiveSliceCount: branchCount,
+              priorGraceUsed: otherTaskUsedGrace(tr, picked.bucket),
+            });
+          }
+        }
+      }
+      if (!ok) {
+        const scopeText = branchSliceNum !== null
+          ? `across slice ${String(branchSliceNum).padStart(3, '0')}`
+          : 'on this branch';
+        return {
+          code: EXIT.failed,
+          refused: true,
+          text: [
+            `FAIL  receipts: review round count (${branchCount}) exceeds maxReviewRounds (${caps.maxReviewRounds}) ${scopeText} (REV-6).`,
+            'Park this branch or add the slice to extraReviewRoundSlices on the base branch, then run this again.',
+          ].join('\n'),
+        };
+      }
+    }
+  }
+
+  if (checkTaskCap) {
+    const taskRounds = getTaskRounds();
+    if (taskRounds.fail) return { code: EXIT.failed, text: `FAIL  receipts: cannot count task review rounds: ${taskRounds.fail}` };
+    for (const key of [...taskRounds.byTask.keys()].sort()) {
+      const bucket = taskRounds.byTask.get(key);
+      const { label: task, rounds } = bucket;
+      const effectiveTaskCount = rounds.size;
+      if (effectiveTaskCount > caps.maxTaskReviewRounds) {
+        const taskGraceOk = caps.graceReviewRound
+          && effectiveTaskCount === caps.maxTaskReviewRounds + 1
+          && taskPassedGrace(bucket, { priorGraceUsed: otherTaskUsedGrace(taskRounds, bucket) });
+        if (!taskGraceOk) {
+          return {
+            code: EXIT.failed,
+            refused: true,
+            text: [
+              `FAIL  receipts: review round count (${effectiveTaskCount}) for task ${task} exceeds maxTaskReviewRounds (${caps.maxTaskReviewRounds}) (REV-6).`,
+              'Rethink or split this task, or add the slice to extraReviewRoundSlices on the base branch, then run this again.',
+            ].join('\n'),
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 // With reviewReceipts on: checkReceipts from scripts/receipt.mjs (loaded by the command line), run with
-// the trusted settings. Returns null when every commit is covered, else { code, text, refused }
-// (refused: true when commits are uncovered, as opposed to the gate itself failing to run).
-function receiptGate(baseRef, scope, ctx) {
+// the trusted settings. Also checks combined slice and per-task review round caps on code pull requests.
+// Returns null when every commit is covered and within cap, else { code, text, refused }
+// (refused: true when commits are uncovered or review caps exceeded, as opposed to the gate failing to run).
+function receiptGate(baseRef, scope, ctx, capOpts = {}) {
   if (!ctx.checkReceipts) {
     return { code: EXIT.usage, text: `FAIL  receipts: the reviewReceipts flag is on, but scripts/receipt.mjs cannot be loaded${ctx.receiptsError ? `: ${ctx.receiptsError}` : ''}. Not merged.` };
   }
@@ -1075,15 +1521,19 @@ function receiptGate(baseRef, scope, ctx) {
   for (const note of r.notes ?? []) ctx.print(`note  receipts: ${note}`);
   if (r.fail) return { code: EXIT.failed, text: `FAIL  receipts: ${r.fail}` };
   const n = r.uncovered.length;
-  if (!n) {
-    ctx.print(`pass  receipts (${r.covered} commit${r.covered === 1 ? '' : 's'} covered by an approving review)`);
-    return null;
+  if (n) {
+    return { code: EXIT.failed, refused: true, text: [
+      `FAIL  receipts: ${n} commit${n === 1 ? ' has' : 's have'} no approving review receipt from a model other than the builder's and the head agent's:`,
+      ...r.uncovered.map((u) => `  ${u.sha.slice(0, 7)} ${u.kind === 'merge' ? 'merge: ' : ''}${u.subject}: ${u.why}`),
+      'Get a review, make its receipt (node scripts/receipt.mjs make <reviewer session file>), commit and push it, then run this again.',
+    ].join('\n') };
   }
-  return { code: EXIT.failed, refused: true, text: [
-    `FAIL  receipts: ${n} commit${n === 1 ? ' has' : 's have'} no approving review receipt from a model other than the builder's and the head agent's:`,
-    ...r.uncovered.map((u) => `  ${u.sha.slice(0, 7)} ${u.kind === 'merge' ? 'merge: ' : ''}${u.subject}: ${u.why}`),
-    'Get a review, make its receipt (node scripts/receipt.mjs make <reviewer session file>), commit and push it, then run this again.',
-  ].join('\n') };
+  if (capOpts.tier === 'code') {
+    const capStopped = checkReviewCaps({ baseRef, branch: capOpts.branch, buildPrefix: capOpts.buildPrefix, baseRaw: capOpts.baseRaw }, ctx);
+    if (capStopped) return capStopped;
+  }
+  ctx.print(`pass  receipts (${r.covered} commit${r.covered === 1 ? '' : 's'} covered by an approving review)`);
+  return null;
 }
 
 // With blockLog on: one JSON line per refusal ("blocked": a failed check, a number clash, an uncovered
@@ -1530,6 +1980,124 @@ function retryCap({ branch, check, slice, write }, ctx) {
   }
 }
 
+// Slice number for a branch name (e.g. build/082-search -> 82, lead/082-thread -> 82, lead/notes -> null).
+function mergeBranchSlice(branch, buildPrefix, branchSliceFn) {
+  if (!branch) return null;
+  if (branchSliceFn) {
+    const s = branchSliceFn(branch, buildPrefix);
+    if (s !== null && s !== undefined && /^\d+$/.test(String(s))) return Number(s);
+  }
+  const m = String(branch).match(/(?:^|\/)(\d{3})(?=-|$)/);
+  return m ? Number(m[1]) : null;
+}
+
+// Pure fallback odometer matching sliceHealth in scripts/slice.mjs, so merge-pr.mjs has no
+// static circular import with slice.mjs (slice.mjs -> token-ledger.mjs -> merge-pr.mjs) and still
+// works if scripts/slice.mjs is absent.
+export function defaultSliceHealth(slice, events, opts = {}) {
+  const sl = Number(slice);
+  const all = Array.isArray(events) ? events : [];
+  const maxPrs = opts.maxPrs ?? DEFAULT_MAX_PRS_PER_THREAD;
+  const maxTasks = opts.maxTasks ?? DEFAULT_MAX_TASKS_PER_THREAD;
+
+  let lastHandoffIndex = -1;
+  let lastHandoff = null;
+  let handoffs = 0;
+  let totalCodePrs = 0;
+  const mergedPrs = [];
+  const seenPrs = new Set();
+  const keptPrMergedIndices = new Set();
+
+  for (let i = 0; i < all.length; i++) {
+    const e = all[i];
+    if (!e || e.slice !== sl) continue;
+    if (e.type === 'slice-handoff') {
+      handoffs++;
+      lastHandoffIndex = i;
+      lastHandoff = e;
+    } else if (e.type === 'pr-merged') {
+      const rawPr = e.data?.pr;
+      const hasPr = rawPr !== undefined && rawPr !== null && rawPr !== '';
+      if (hasPr) {
+        const key = String(rawPr);
+        if (seenPrs.has(key)) continue;
+        seenPrs.add(key);
+      }
+      keptPrMergedIndices.add(i);
+      const tier = e.data?.tier ?? 'code';
+      if (tier !== 'paperwork') totalCodePrs++;
+      mergedPrs.push({
+        pr: hasPr ? rawPr : null,
+        branch: e.data?.branch ?? e.branch ?? null,
+        tier,
+        at: e.at ?? null,
+      });
+    }
+  }
+
+  let codePrsSinceHandoff = 0;
+  const doneTasks = new Set();
+  for (let i = lastHandoffIndex + 1; i < all.length; i++) {
+    const e = all[i];
+    if (!e || e.slice !== sl) continue;
+    if (e.type === 'pr-merged' && keptPrMergedIndices.has(i) && (e.data?.tier ?? 'code') !== 'paperwork') {
+      codePrsSinceHandoff++;
+    } else if (e.type === 'task-done' && e.data?.task !== undefined && e.data?.task !== null) {
+      doneTasks.add(Number(e.data.task));
+    }
+  }
+
+  const tasksDoneSinceHandoff = doneTasks.size;
+  const reasons = [];
+  if (codePrsSinceHandoff >= maxPrs) {
+    reasons.push(`${codePrsSinceHandoff} code PR${codePrsSinceHandoff === 1 ? '' : 's'} merged since last handoff (limit ${maxPrs})`);
+  }
+  if (tasksDoneSinceHandoff >= maxTasks) {
+    reasons.push(`${tasksDoneSinceHandoff} task${tasksDoneSinceHandoff === 1 ? '' : 's'} finished since last handoff (limit ${maxTasks})`);
+  }
+  return {
+    slice: sl,
+    codePrsSinceHandoff,
+    tasksDoneSinceHandoff,
+    maxPrs,
+    maxTasks,
+    totalCodePrs,
+    handoffs,
+    lastHandoffAt: lastHandoff?.at ?? null,
+    mergedPrs,
+    handoffRecommended: reasons.length > 0,
+    reasons,
+  };
+}
+
+// Automatic post-merge odometer: warns when the current thread has hit the handoff threshold for
+// this slice. Runs safely inside try/catch so an odometer error can never break a completed merge.
+function checkMergeOdometer({ slice, pr, branch, tier, prMergedEvent }, ctx) {
+  try {
+    if (!ctx.readEvents) return;
+    const read = ctx.readEvents(ctx.root, { types: ['pr-merged', 'task-done', 'slice-handoff'] });
+    const events = Array.isArray(read?.events) ? [...read.events] : [];
+    const current = prMergedEvent || {
+      type: 'pr-merged',
+      slice,
+      branch,
+      at: new Date(ctx.now()).toISOString(),
+      data: { pr, branch, tier },
+    };
+    const alreadyPresent = current.id
+      ? events.some((e) => e && e.id === current.id)
+      : events.some((e) => e && e.type === 'pr-merged' && e.slice === slice && e.data?.pr === pr);
+    if (!alreadyPresent) events.push(current);
+    const health = (ctx.sliceHealth || defaultSliceHealth)(slice, events);
+    if (health?.handoffRecommended) {
+      ctx.print(`HANDOFF REQUIRED (odometer): ${health.reasons.join('; ')}.`);
+      ctx.print(`Next: run node scripts/slice.mjs handoff --slice ${slice} --next "<next step>", wait for running workers to finish, and launch a fresh continuation head thread before starting the next task.`);
+    }
+  } catch {
+    // An odometer error must never break a completed merge.
+  }
+}
+
 // After GitHub confirms a merge, with events on: the `merged` event, one `weakening` event per ruled
 // weakening, and for each plan the merge moved into completed/ as done, `slice-closed` plus a `task-done`
 // (auto: true) for each task nobody logged as done or dropped. Never throws.
@@ -1601,6 +2169,66 @@ function printSkipped(skipped, ctx) {
 function treeOf(spec, ctx) {
   const r = ctx.git(['rev-parse', '-q', '--verify', spec]);
   return r.code === 0 ? r.stdout.trim() : '';
+}
+
+// ---------- Pull request size ----------
+
+// The rows of `git diff --numstat -z`: [{ added, deleted, file }], added and deleted as text ("-" for a
+// binary file). Each row is "<added>\t<deleted>\t<path>" ending in NUL; a rename or copy is
+// "<added>\t<deleted>\t" then NUL, the old path, NUL, the new path, NUL, and file is the new path.
+// Paths come raw (no quotes, no " => "), so "café/a.ts" and a file named "a => b.ts" read as they are.
+export function parseNumstatZ(text) {
+  const parts = String(text ?? '').split('\0');
+  const rows = [];
+  for (let i = 0; i < parts.length; i++) {
+    const m = /^(-|\d+)\t(-|\d+)\t([\s\S]*)$/.exec(parts[i]);
+    if (!m) continue;
+    let file = m[3];
+    if (file === '') {
+      file = parts[i + 2] ?? '';
+      i += 2;
+    }
+    if (file) rows.push({ added: m[1], deleted: m[2], file });
+  }
+  return rows;
+}
+
+// Added lines of product code in `git diff --numstat -z` output. Binary rows ("-") are skipped. A
+// file counts when it is in productPaths (any file when that list is empty), and is not paperwork, not
+// in docs/, and not a test by testPaths. Returns { lines, files }: the added lines, and the files that counted.
+export function countPrProductAddedLines(numstatZ, { productPaths = [], paperworkPaths = ['docs/', 'AGENTS.md'], testPaths = settings({}).testPaths } = {}) {
+  const inProduct = (f) => !productPaths.length || productPaths.some((p) => f.startsWith(p.endsWith('/') ? p : `${p}/`) || f === p);
+  let lines = 0;
+  const files = [];
+  for (const { added, file } of parseNumstatZ(numstatZ)) {
+    if (added === '-') continue;
+    if (!inProduct(file) || file.startsWith('docs/') || isPaperwork(file, paperworkPaths) || isTestFile(file, testPaths)) continue;
+    lines += Number(added);
+    files.push(file);
+  }
+  return { lines, files };
+}
+
+// The WARNING line when a pull request adds more product lines than max, else null. max null or 0: off.
+export function checkPrSizeWarning({ lines, max }) {
+  if (!Number.isInteger(max) || max <= 0 || lines <= max) return null;
+  return `WARNING: this pull request adds ${lines} lines of product code (maxPrProductLines is ${max}). Split the task into smaller pull requests before spending review rounds on it. This warning does not stop anything.`;
+}
+
+// Prints the size warning for baseRef...HEAD with the settings in use. testPaths: what counts as a
+// test (the guard scope's list, base and branch together). Never throws, never stops a run.
+function printPrSize(baseRef, cfg, testPaths, ctx) {
+  try {
+    const max = cfg.maxPrProductLines === undefined ? DEFAULT_MAX_PR_PRODUCT_LINES : cfg.maxPrProductLines;
+    if (!Number.isInteger(max) || max <= 0) return;
+    const stat = ctx.git(['diff', '--numstat', '-z', `${baseRef}...HEAD`]);
+    if (stat.code !== 0) return;
+    const { lines } = countPrProductAddedLines(stat.stdout, { productPaths: cfg.productPaths ?? [], paperworkPaths: cfg.paperworkPaths ?? ['docs/', 'AGENTS.md'], testPaths });
+    const warning = checkPrSizeWarning({ lines, max });
+    if (warning) ctx.print(warning);
+  } catch {
+    // A size count that cannot be made is not worth a stopped check: the warning is advice only.
+  }
 }
 
 // ---------- The two flows ----------
@@ -1675,6 +2303,7 @@ export function checkOnly(opts, ctx) {
   if (diff.code === 0) {
     tier = [...splitZ(diff.stdout), ...unsaved].every(scope.isPaperwork) ? 'paperwork' : 'code';
     printRisk(riskOf([...splitZ(diff.stdout), ...unsaved], scope.highRiskPaths), scope, ctx);
+    printPrSize(baseRef, picked.cfg, scope.testPaths, ctx);
   } else ctx.print(`Warning: cannot compare with ${baseRef}, so this counts as a code change.`);
 
   // Unsaved files are not part of the tree hash, so a remembered pass would be about other files.
@@ -1872,6 +2501,7 @@ function mergeSteps(opts, ctx, lock) {
     tier = splitZ(diff.stdout).every(scope.isPaperwork) ? 'paperwork' : 'code';
     risk = riskOf(splitZ(diff.stdout), scope.highRiskPaths);
     printRisk(risk, scope, ctx);
+    if (attempt === 1) printPrSize(baseRef, cfg, scope.testPaths, ctx);
     touchedTests = undefined;
     const lost = gate('protectedTests', 'protected tests', () => {
       const touched = protectedTests(baseRef, scope.testPaths, ctx);
@@ -1892,7 +2522,7 @@ function mergeSteps(opts, ctx, lock) {
       return reviewScope(scope, { items, pathMatches: ctx.pathMatches, own });
     };
     const unreviewed = gate('reviewReceipts', 'receipts', () => {
-      const stopped = receiptGate(baseRef, reviewed([]), ctx);
+      const stopped = receiptGate(baseRef, reviewed([]), ctx, { branch: head, tier, buildPrefix: cfg.buildPrefix, baseRaw: picked.baseRaw });
       if (!stopped) log('passed', 'receipts');
       return stopped;
     });
@@ -2054,10 +2684,18 @@ function mergeSteps(opts, ctx, lock) {
       lock.held = false;
     }
     ctx.print(`Pull request #${opts.pr} (${head} into ${base}) was accepted by GitHub (state: ${finalState ?? 'unknown'}), not merged yet.`);
+    ctx.print('note  pr-merged event not recorded yet: pull request is not in MERGED state yet.');
     ctx.print('note  worktree cleanup skipped: pull request is not in MERGED state yet.');
     return EXIT.ok;
   }
   ctx.print(`Merged pull request #${opts.pr} (${head} into ${base}) at ${shortSha}.`);
+  const mergedSlice = mergeBranchSlice(head, cfg.buildPrefix, ctx.branchSlice);
+  const prMergedEvent = scope.events && mergedSlice !== null
+    ? write('pr-merged', { pr: opts.pr, branch: head, tier }, { slice: mergedSlice })
+    : null;
+  if (tier !== 'paperwork' && mergedSlice !== null) {
+    checkMergeOdometer({ slice: mergedSlice, pr: opts.pr, branch: head, tier, prMergedEvent }, ctx);
+  }
   log('merged', null);
   // testReasons: true only when the weakening gate was met, so every weakening in this merge is on record.
   if (scope.events) recordMerge({ pr: opts.pr, tier, baseRef, cfg, risk, weak, testReasons: weak !== undefined, more, answers, write }, ctx);
@@ -2083,16 +2721,51 @@ function mergeSteps(opts, ctx, lock) {
   return EXIT.ok;
 }
 
-// Runs clean-worktrees.mjs after a successful merge. Exported so tests cover argument passing,
+// The repo's main checkout: the first entry of `git worktree list --porcelain`, or `root` if git
+// cannot say.
+export function mainCheckout(root, execFn = exec) {
+  const r = execFn('git', ['worktree', 'list', '--porcelain'], root);
+  const first = r.code === 0 ? String(r.stdout).split('\n').find((l) => l.startsWith('worktree ')) : null;
+  return first ? first.slice('worktree '.length) : root;
+}
+
+// True when `ps -o args=` text is a shell running a one-shot command (`zsh -c "..."`, `bash -lc`).
+// Such a shell ends when this script ends. An interactive or login shell (`-zsh`, `zsh -l`) is not one.
+export function isOneShotShell(args) {
+  const words = String(args ?? '').trim().split(/\s+/);
+  if (!/^(sh|bash|zsh|dash|ksh|fish)$/.test(words[0].split('/').pop())) return false;
+  for (const w of words.slice(1)) {
+    if (!w.startsWith('-') || w === '--') return false;
+    if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(w)) return true;
+  }
+  return false;
+}
+
+// The program ids clean-worktrees.mjs may leave out of its "a program is using it" check, and only
+// for the just-merged worktree. Only when this merge runs from a linked worktree: this script, plus
+// its parent if that parent is a one-shot shell (how agents run commands). An interactive terminal,
+// an editor, or an agent's own process still keeps the folder.
+export function cleanupIgnorePids(root, mainRoot, { pid = process.pid, ppid = process.ppid, execFn = exec } = {}) {
+  if (real(root) === real(mainRoot)) return [];
+  const pids = [pid];
+  if (!(ppid > 1)) return pids;
+  const parent = execFn('ps', ['-o', 'args=', '-p', String(ppid)], root);
+  if (parent.code === 0 && isOneShotShell(parent.stdout)) pids.push(ppid);
+  return pids;
+}
+
+// Runs clean-worktrees.mjs after a successful merge, from the main checkout so the merged worktree
+// is never "the copy this runs from". Exported so tests cover argument passing,
 // partial failures, timeouts, and non-zero exits without spawning a live cleanup over real repos.
-export function runPostMergeCleanup({ baseRef, branch, commit = '', noFetch = false, root, scriptPath, execFn = exec }) {
+export function runPostMergeCleanup({ baseRef, branch, commit = '', noFetch = false, root, mainRoot = root, ignorePids = [], scriptPath, execFn = exec }) {
   const script = scriptPath ?? join(dirname(fileURLToPath(import.meta.url)), 'clean-worktrees.mjs');
   if (!existsSync(script)) return null;
   const args = [script, '--delete'];
   if (noFetch) args.push('--no-fetch');
   args.push('--base', baseRef, '--merged-branch', branch);
   if (commit) args.push('--merged-commit', commit);
-  const r = execFn(process.execPath, args, root, undefined, 120_000);
+  for (const pid of ignorePids) args.push('--ignore-pid', String(pid));
+  const r = execFn(process.execPath, args, mainRoot, undefined, 120_000);
   if (r.timedOut) return { line: 'note  worktrees: cleanup timed out after 120 s (some finished worktrees may already have been removed).' };
   const lines = String(r.stdout ?? '').trim().split('\n').filter(Boolean);
   const doneLine = [...lines].reverse().find((l) => l.startsWith('Done.'));
@@ -2211,6 +2884,18 @@ async function cli(argv) {
     neededCommits: receipts?.neededCommits,
     checkWeakenings: receipts?.checkWeakenings,
     approvals: receipts?.approvals,
+    countBranchReceipts: receipts?.countBranchReceipts,
+    countSliceReceipts: receipts?.countSliceReceipts,
+    countTaskReceipts: receipts?.countTaskReceipts,
+    baseReceiptSlicesFromGit: receipts?.baseReceiptSlicesFromGit,
+    receiptSliceOf: receipts?.receiptSliceOf,
+    normalizeTaskId: receipts?.normalizeTaskId,
+    roundKey: receipts?.roundKey,
+    defaultMaxReviewRounds: receipts?.DEFAULT_MAX_REVIEW_ROUNDS,
+    defaultMaxTaskReviewRounds: receipts?.DEFAULT_MAX_TASK_REVIEW_ROUNDS,
+    defaultGraceReviewRound: receipts?.DEFAULT_GRACE_REVIEW_ROUND,
+    evaluateGraceRound: receipts?.evaluateGraceRound,
+    verifyReceiptRecord: receipts?.verifyReceiptRecord,
     receiptsError,
     collectWeakenings: sorter?.collect,
     sorterError,
@@ -2236,9 +2921,13 @@ async function cli(argv) {
     findingsError,
     parseTasks: checker.parseTasks,
     taskStates: slices?.taskStates,
+    sliceHealth: slices?.sliceHealth,
     git: (args, input) => exec('git', args, root, input),
     gh: (args, { timeoutMs } = {}) => exec('gh', args, root, undefined, timeoutMs),
-    cleanWorktrees: ({ baseRef, branch, commit, noFetch }) => runPostMergeCleanup({ baseRef, branch, commit, noFetch, root }),
+    cleanWorktrees: ({ baseRef, branch, commit, noFetch }) => {
+      const mainRoot = mainCheckout(root);
+      return runPostMergeCleanup({ baseRef, branch, commit, noFetch, root, mainRoot, ignorePids: cleanupIgnorePids(root, mainRoot) });
+    },
     run: runToLog,
     print: (line) => console.log(line),
     now: () => Date.now(),

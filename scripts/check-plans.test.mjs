@@ -20,6 +20,7 @@ import {
   countInbox, firstUnplannedRow, buildStatus, formatStatus, checkClaims, parseTasks, tasksProblem, TASK_TITLE_MAX,
   pathsOverlap, ownPath, checkInvariants, INVARIANTS_FILE, INVARIANTS_MARKER, countOpenAsks, checkOwnedChanges, stripHtmlComments,
   checkVerifyRecipe, VERIFY_FILE, VERIFY_MARKER, checkChangeChecklist, CHECKLIST_FILE, CHECKLIST_MARKER, claimCheckOn,
+  broadClaim, screenClaims,
 } from './check-plans.mjs';
 
 const CHECKER = join(dirname(fileURLToPath(import.meta.url)), 'check-plans.mjs');
@@ -2102,4 +2103,434 @@ test('5.1 change checklist: the rule checker and scripts/checklist.mjs agree on 
   assert.equal(checkChangeChecklist(twice).length, 1);
   assert.equal(parseChecklist(twice).problems.length, 1);
   assert.ok(checkChangeChecklist(twice)[0].startsWith(`${CHECKLIST_FILE}:10:`) && parseChecklist(twice).problems[0].startsWith(`${CHECKLIST_FILE}:10:`));
+});
+
+// ---------- Kit 5.3: pre-flight slice size gate (maxTasksPerSlice, maxOwnsPerSlice, extraTaskSlices, maxTaskReviewRounds) ----------
+
+test('5.3 settings: maxTasksPerSlice, maxOwnsPerSlice, extraTaskSlices, and maxTaskReviewRounds defaults and validation', () => {
+  assert.equal(DEFAULT_CONFIG.maxTasksPerSlice, 3);
+  assert.equal(DEFAULT_CONFIG.maxOwnsPerSlice, 10);
+  assert.deepEqual(DEFAULT_CONFIG.extraTaskSlices, []);
+  assert.equal(DEFAULT_CONFIG.maxTaskReviewRounds, 4);
+  assert.equal(DEFAULT_CONFIG.maxReviewRounds, 12);
+  assert.equal(DEFAULT_CONFIG.graceReviewRound, true);
+
+  const ok = mergeConfig({ maxTasksPerSlice: 5, maxOwnsPerSlice: 4, extraTaskSlices: [0, 12], maxTaskReviewRounds: 6, graceReviewRound: false });
+  assert.equal(ok.maxTasksPerSlice, 5);
+  assert.equal(ok.maxOwnsPerSlice, 4);
+  assert.deepEqual(ok.extraTaskSlices, [0, 12]);
+  assert.equal(ok.maxTaskReviewRounds, 6);
+  assert.equal(ok.graceReviewRound, false);
+  for (const bad of ['true', 1, null, []]) {
+    assert.throws(() => mergeConfig({ graceReviewRound: bad }), /wrong type/, `graceReviewRound=${JSON.stringify(bad)}`);
+  }
+
+  const disabled = mergeConfig({ maxTasksPerSlice: null, maxOwnsPerSlice: null, maxTaskReviewRounds: null });
+  assert.equal(disabled.maxTasksPerSlice, null);
+  assert.equal(disabled.maxOwnsPerSlice, null);
+  assert.equal(disabled.maxTaskReviewRounds, null);
+
+  const root = makeDir({
+    [CONFIG_FILE]: JSON.stringify({ maxTasksPerSlice: 4, maxOwnsPerSlice: 3, extraTaskSlices: [7], maxTaskReviewRounds: 5 }),
+  });
+  const loaded = loadConfig(root);
+  assert.equal(loaded.maxTasksPerSlice, 4);
+  assert.equal(loaded.maxOwnsPerSlice, 3);
+  assert.deepEqual(loaded.extraTaskSlices, [7]);
+  assert.equal(loaded.maxTaskReviewRounds, 5);
+
+  for (const key of ['maxTasksPerSlice', 'maxOwnsPerSlice', 'maxTaskReviewRounds']) {
+    for (const bad of [0, -1, 2.5]) {
+      assert.throws(() => mergeConfig({ [key]: bad }), new RegExp(`"${key}" must be a whole number`), `${key}=${bad}`);
+    }
+    for (const bad of ['3', true, [], {}]) {
+      assert.throws(() => mergeConfig({ [key]: bad }), /wrong type/, `${key}=${JSON.stringify(bad)}`);
+    }
+  }
+  for (const bad of [[-1], [1.5], ['4'], [null]]) {
+    assert.throws(() => mergeConfig({ extraTaskSlices: bad }), /"extraTaskSlices" must list slice ids/, JSON.stringify(bad));
+  }
+  for (const bad of ['4', 4, {}]) {
+    assert.throws(() => mergeConfig({ extraTaskSlices: bad }), /wrong type/, JSON.stringify(bad));
+  }
+});
+
+test('5.3 slice size gate: maxTasksPerSlice fails over limit, passes at limit, spares base plans, and honors extraTaskSlices or null', () => {
+  const mkTasks = (count) => Array.from({ length: count }, (_, i) => ({ n: i + 1, title: `Task ${i + 1}` }));
+  const entry = (id, count, owns = 'none') => {
+    const file = `${String(id).padStart(3, '0')}-slice.md`;
+    const path = `docs/plans/active/${file}`;
+    const text = logPlan({ id }).replace(LOG, `docs/plans/logs/${file}`).replace('owns: none', `owns: ${owns}`);
+    return { folder: 'active', file, path, header: parsePlan(text).header, tasks: mkTasks(count) };
+  };
+  const noBase = () => null;
+
+  const three = entry(1, 3);
+  assert.deepEqual(checkNewPlans({ plans: [three], changes: [{ status: 'A', path: three.path }], readBase: noBase }), []);
+
+  const four = entry(1, 4);
+  const errs = checkNewPlans({ plans: [four], changes: [{ status: 'A', path: four.path }], readBase: noBase });
+  assert.equal(errs.length, 1);
+  assert.ok(errs[0].includes('new plan has 4 tasks (max 3)'), errs[0]);
+  assert.ok(errs[0].includes('split the roadmap row into smaller sequential slices'), errs[0]);
+  assert.ok(errs[0].includes('extraTaskSlices'), errs[0]);
+
+  // Pre-existing plan on the base branch with 5 tasks passes (never retroactively broken).
+  const five = entry(1, 5);
+  assert.deepEqual(checkNewPlans({ plans: [five], changes: [{ status: 'M', path: five.path }], readBase: (p) => (p === five.path ? 'x' : null) }), []);
+  assert.deepEqual(checkNewPlans({ plans: [five], changes: [{ status: 'A', path: five.path }], readBase: (p) => (p === five.path ? 'x' : null) }), []);
+  const moved = { ...five, folder: 'completed', path: 'docs/plans/completed/001-slice.md' };
+  assert.deepEqual(checkNewPlans({ plans: [moved], changes: [{ status: 'A', path: moved.path }], readBase: (p) => (p === five.path ? 'x' : null) }), []);
+
+  // extraTaskSlices allows slice 1 (direct config call), but not slice 2.
+  const allow1 = mergeConfig({ extraTaskSlices: [1] });
+  assert.deepEqual(checkNewPlans({ plans: [four], changes: [{ status: 'A', path: four.path }], readBase: noBase, config: allow1 }), []);
+  const fourSlice2 = entry(2, 4);
+  assert.ok(has(checkNewPlans({ plans: [fourSlice2], changes: [{ status: 'A', path: fourSlice2.path }], readBase: noBase, config: allow1 }), 'new plan has 4 tasks (max 3)'));
+
+  // When baseConfig is given, extraTaskSlices comes from the base branch, not proposed config.
+  const deniedByBase = checkNewPlans({
+    plans: [four],
+    changes: [{ status: 'A', path: four.path }],
+    readBase: noBase,
+    config: allow1,
+    baseConfig: mergeConfig({ extraTaskSlices: [] }),
+  });
+  assert.ok(has(deniedByBase, 'new plan has 4 tasks (max 3)'));
+  const allowedByBase = checkNewPlans({
+    plans: [four],
+    changes: [{ status: 'A', path: four.path }],
+    readBase: noBase,
+    config: mergeConfig({ extraTaskSlices: [] }),
+    baseConfig: allow1,
+  });
+  assert.deepEqual(allowedByBase, []);
+
+  // maxTasksPerSlice: null disables the cap.
+  const noCap = mergeConfig({ maxTasksPerSlice: null });
+  assert.deepEqual(checkNewPlans({ plans: [five], changes: [{ status: 'A', path: five.path }], readBase: noBase, config: noCap }), []);
+});
+
+test('5.3 slice size gate: maxOwnsPerSlice fails when exceeded and passes when within limit, none, base, or overridden', () => {
+  const entry = (id, owns) => {
+    const file = `${String(id).padStart(3, '0')}-slice.md`;
+    const path = `docs/plans/active/${file}`;
+    const text = logPlan({ id }).replace(LOG, `docs/plans/logs/${file}`).replace('owns: none', `owns: ${owns}`);
+    return { folder: 'active', file, path, header: parsePlan(text).header, tasks: [{ n: 1, title: 'One' }] };
+  };
+  const noBase = () => null;
+  const cap2 = mergeConfig({ maxOwnsPerSlice: 2 });
+
+  const ownsNone = entry(1, 'none');
+  assert.deepEqual(checkNewPlans({ plans: [ownsNone], changes: [{ status: 'A', path: ownsNone.path }], readBase: noBase, config: cap2 }), []);
+
+  const ownsTwo = entry(1, '[src/a.ts, src/b.ts]');
+  assert.deepEqual(checkNewPlans({ plans: [ownsTwo], changes: [{ status: 'A', path: ownsTwo.path }], readBase: noBase, config: cap2 }), []);
+
+  const ownsThree = entry(1, '[src/a.ts, src/b.ts, src/c.ts]');
+  assert.deepEqual(checkNewPlans({ plans: [ownsThree], changes: [{ status: 'A', path: ownsThree.path }], readBase: noBase }), [], 'within the default cap of 10');
+  const errs = checkNewPlans({ plans: [ownsThree], changes: [{ status: 'A', path: ownsThree.path }], readBase: noBase, config: cap2 });
+  assert.equal(errs.length, 1);
+  assert.ok(errs[0].includes('new plan owns 3 paths (max 2)'), errs[0]);
+  assert.ok(errs[0].includes('split the slice into smaller slices with narrower ownership'), errs[0]);
+
+  const override = mergeConfig({ maxOwnsPerSlice: 2, extraTaskSlices: [1] });
+  assert.deepEqual(checkNewPlans({ plans: [ownsThree], changes: [{ status: 'A', path: ownsThree.path }], readBase: noBase, config: override }), []);
+
+  // Pre-existing plan on base branch with 3 owns passes.
+  assert.deepEqual(checkNewPlans({ plans: [ownsThree], changes: [{ status: 'A', path: ownsThree.path }], readBase: (p) => (p === ownsThree.path ? 'x' : null), config: cap2 }), []);
+});
+
+test('git: 5.3 slice size gate enforces maxTasksPerSlice and maxOwnsPerSlice on new plans only, reading extraTaskSlices from base', () => {
+  const tasksOf = (n) => `## Tasks\n\n${Array.from({ length: n }, (_, i) => `${i + 1}. Step ${i + 1}`).join('\n')}\n\n`;
+  const makePlan = (id, name, taskCount, owns = 'none') => logPlan({ id })
+    .replace(LOG, `docs/plans/logs/${name}.md`)
+    .replace(TASKS, tasksOf(taskCount))
+    .replace('owns: none', `owns: ${owns}`);
+
+  // Base already has slice 001 with 5 tasks and 4 owned paths; it must stay valid.
+  const root = makeRepo({
+    [P]: makePlan(1, '001-app-shell', 5, '[src/a.ts, src/b.ts, src/c.ts, src/d.ts]'),
+    [CONFIG_FILE]: JSON.stringify({ maxOwnsPerSlice: 2 }),
+  });
+  assert.ok(runChecker(root).ok, 'existing base plan with 5 tasks and 4 owns stays valid');
+
+  git(root, 'checkout', '-qb', 'lead/plan-002');
+  const P2 = 'docs/plans/active/002-big.md';
+  write(root, 'docs/roadmap.md', `${ROADMAP_001}| 002 | Big | [plan](plans/active/002-big.md) |\n`);
+  write(root, P2, makePlan(2, '002-big', 4, '[src/x.ts, src/y.ts, src/z.ts]'));
+  git(root, 'add', '-A');
+  const bad = runChecker(root, ['--staged']);
+  assert.ok(!bad.ok);
+  assert.ok(bad.out.includes(`${P2}: new plan has 4 tasks (max 3)`), bad.out);
+  assert.ok(bad.out.includes(`${P2}: new plan owns 3 paths (max 2)`), bad.out);
+  assert.ok(!bad.out.includes('001-app-shell.md'), bad.out);
+
+  // Adding slice 2 to extraTaskSlices on the lead branch itself does not bypass the base branch gate.
+  write(root, CONFIG_FILE, JSON.stringify({ maxOwnsPerSlice: 2, extraTaskSlices: [2] }));
+  git(root, 'add', CONFIG_FILE);
+  const bypass = runChecker(root, ['--staged']);
+  assert.ok(!bypass.ok, 'lead branch cannot grant itself extraTaskSlices');
+  assert.ok(bypass.out.includes(`${P2}: new plan has 4 tasks (max 3)`), bypass.out);
+
+  // Within limits (3 tasks, 2 owns) passes.
+  write(root, CONFIG_FILE, JSON.stringify({ maxOwnsPerSlice: 2 }));
+  write(root, P2, makePlan(2, '002-big', 3, '[src/x.ts, src/y.ts]'));
+  git(root, 'add', '-A');
+  const okSmall = runChecker(root, ['--staged']);
+  assert.ok(okSmall.ok, okSmall.out);
+
+  // Owner adds slice 2 to extraTaskSlices on main; now 4 tasks and 3 owns pass on the lead branch.
+  git(root, 'reset', '-q', '--hard');
+  git(root, 'checkout', '-q', 'main');
+  write(root, CONFIG_FILE, JSON.stringify({ maxOwnsPerSlice: 2, extraTaskSlices: [2] }));
+  git(root, 'commit', '-qam', 'allow slice 2 extra tasks');
+  git(root, 'checkout', '-q', 'lead/plan-002');
+  git(root, 'rebase', '-q', 'main');
+  write(root, 'docs/roadmap.md', `${ROADMAP_001}| 002 | Big | [plan](plans/active/002-big.md) |\n`);
+  write(root, P2, makePlan(2, '002-big', 4, '[src/x.ts, src/y.ts, src/z.ts]'));
+  git(root, 'add', '-A');
+  const okOverride = runChecker(root, ['--staged']);
+  assert.ok(okOverride.ok, okOverride.out);
+});
+
+test('5.3 slice size gate: a lead branch cannot waive or raise maxTasksPerSlice or maxOwnsPerSlice, and tightening takes effect', () => {
+  const mkTasks = (count) => Array.from({ length: count }, (_, i) => ({ n: i + 1, title: `Task ${i + 1}` }));
+  const entry = (id, count, owns = 'none') => {
+    const file = `${String(id).padStart(3, '0')}-slice.md`;
+    const path = `docs/plans/active/${file}`;
+    const text = logPlan({ id }).replace(LOG, `docs/plans/logs/${file}`).replace('owns: none', `owns: ${owns}`);
+    return { folder: 'active', file, path, header: parsePlan(text).header, tasks: mkTasks(count) };
+  };
+  const noBase = () => null;
+  const check = (planEntry, config, baseConfig) => checkNewPlans({
+    plans: [planEntry],
+    changes: [{ status: 'A', path: planEntry.path }],
+    readBase: noBase,
+    config,
+    baseConfig,
+  });
+
+  // 1. Lead branch sets maxTasksPerSlice to null or 10 while base has 3: still fails on a 4-task new plan.
+  const fourTasks = entry(2, 4);
+  const baseTasks3 = mergeConfig({ maxTasksPerSlice: 3 });
+  assert.ok(has(check(fourTasks, mergeConfig({ maxTasksPerSlice: null }), baseTasks3), 'new plan has 4 tasks (max 3)'));
+  assert.ok(has(check(fourTasks, mergeConfig({ maxTasksPerSlice: 10 }), baseTasks3), 'new plan has 4 tasks (max 3)'));
+
+  // 2. Lead branch sets maxOwnsPerSlice to null or 10 while base has 2: still fails on a 3-owns new plan.
+  const threeOwns = entry(2, 1, '[src/a.ts, src/b.ts, src/c.ts]');
+  const baseOwns2 = mergeConfig({ maxOwnsPerSlice: 2 });
+  assert.ok(has(check(threeOwns, mergeConfig({ maxOwnsPerSlice: null }), baseOwns2), 'new plan owns 3 paths (max 2)'));
+  assert.ok(has(check(threeOwns, mergeConfig({ maxOwnsPerSlice: 10 }), baseOwns2), 'new plan owns 3 paths (max 2)'));
+
+  // 3. Lead branch tightening the cap takes effect (null -> 2, and 4 -> 2).
+  const threeTasks = entry(2, 3);
+  assert.ok(has(check(threeTasks, mergeConfig({ maxTasksPerSlice: 2 }), mergeConfig({ maxTasksPerSlice: null })), 'new plan has 3 tasks (max 2)'));
+  assert.ok(has(check(threeTasks, mergeConfig({ maxTasksPerSlice: 2 }), mergeConfig({ maxTasksPerSlice: 4 })), 'new plan has 3 tasks (max 2)'));
+  assert.ok(has(check(threeOwns, mergeConfig({ maxOwnsPerSlice: 2 }), mergeConfig({ maxOwnsPerSlice: null })), 'new plan owns 3 paths (max 2)'));
+  assert.ok(has(check(threeOwns, mergeConfig({ maxOwnsPerSlice: 2 }), mergeConfig({ maxOwnsPerSlice: 4 })), 'new plan owns 3 paths (max 2)'));
+
+  // Both null keeps the cap off.
+  assert.deepEqual(check(fourTasks, mergeConfig({ maxTasksPerSlice: null }), mergeConfig({ maxTasksPerSlice: null })), []);
+  assert.deepEqual(check(threeOwns, mergeConfig({ maxOwnsPerSlice: null }), mergeConfig({ maxOwnsPerSlice: null })), []);
+});
+
+test('git: 5.3 lead branch cannot waive base maxTasksPerSlice or maxOwnsPerSlice in the same PR, and tightening takes effect', () => {
+  const tasksOf = (n) => `## Tasks\n\n${Array.from({ length: n }, (_, i) => `${i + 1}. Step ${i + 1}`).join('\n')}\n\n`;
+  const makePlan = (id, name, taskCount, owns = 'none') => logPlan({ id })
+    .replace(LOG, `docs/plans/logs/${name}.md`)
+    .replace(TASKS, tasksOf(taskCount))
+    .replace('owns: none', `owns: ${owns}`);
+
+  const root = makeRepo({
+    [CONFIG_FILE]: JSON.stringify({ maxTasksPerSlice: 3, maxOwnsPerSlice: 2 }),
+  });
+  git(root, 'checkout', '-qb', 'lead/plan-002');
+  const P2 = 'docs/plans/active/002-big.md';
+  write(root, 'docs/roadmap.md', `${ROADMAP_001}| 002 | Big | [plan](plans/active/002-big.md) |\n`);
+  write(root, P2, makePlan(2, '002-big', 4, '[src/x.ts, src/y.ts, src/z.ts]'));
+
+  // Trying to waive caps with null on the lead branch still fails against base (3 tasks, 2 owns).
+  write(root, CONFIG_FILE, JSON.stringify({ maxTasksPerSlice: null, maxOwnsPerSlice: null }));
+  git(root, 'add', '-A');
+  const waivedNull = runChecker(root, ['--staged']);
+  assert.ok(!waivedNull.ok, 'lead branch cannot disable base caps with null');
+  assert.ok(waivedNull.out.includes(`${P2}: new plan has 4 tasks (max 3)`), waivedNull.out);
+  assert.ok(waivedNull.out.includes(`${P2}: new plan owns 3 paths (max 2)`), waivedNull.out);
+
+  // Trying to raise caps to 10 on the lead branch still fails against base (3 tasks, 2 owns).
+  write(root, CONFIG_FILE, JSON.stringify({ maxTasksPerSlice: 10, maxOwnsPerSlice: 10 }));
+  git(root, 'add', CONFIG_FILE);
+  const raised = runChecker(root, ['--staged']);
+  assert.ok(!raised.ok, 'lead branch cannot raise base caps');
+  assert.ok(raised.out.includes(`${P2}: new plan has 4 tasks (max 3)`), raised.out);
+  assert.ok(raised.out.includes(`${P2}: new plan owns 3 paths (max 2)`), raised.out);
+
+  // Tightening caps on the lead branch (3 -> 2 tasks, 2 -> 1 own) enforces the stricter branch limits.
+  write(root, CONFIG_FILE, JSON.stringify({ maxTasksPerSlice: 2, maxOwnsPerSlice: 1 }));
+  write(root, P2, makePlan(2, '002-big', 3, '[src/x.ts, src/y.ts]'));
+  git(root, 'add', '-A');
+  const tightened = runChecker(root, ['--staged']);
+  assert.ok(!tightened.ok, 'tighter branch caps take effect');
+  assert.ok(tightened.out.includes(`${P2}: new plan has 3 tasks (max 2)`), tightened.out);
+  assert.ok(tightened.out.includes(`${P2}: new plan owns 2 paths (max 1)`), tightened.out);
+});
+
+// ---------- Kit 5.3.2: broad owns, maxOwnsPerSlice default 10, screen cap ----------
+
+const sizeEntry = (id, owns) => {
+  const file = `${String(id).padStart(3, '0')}-slice.md`;
+  const path = `docs/plans/active/${file}`;
+  const text = logPlan({ id }).replace(LOG, `docs/plans/logs/${file}`).replace('owns: none', `owns: ${owns}`);
+  return { folder: 'active', file, path, header: parsePlan(text).header, tasks: [{ n: 1, title: 'One' }] };
+};
+const sizeCheck = (planEntry, config = DEFAULT_CONFIG, baseConfig = null) =>
+  checkNewPlans({ plans: [planEntry], changes: [{ status: 'A', path: planEntry.path }], readBase: () => null, config, baseConfig });
+const ownsList = (n, prefix = 'src/f') => `[${Array.from({ length: n }, (_, i) => `${prefix}${i + 1}.ts`).join(', ')}]`;
+
+test('5.3.2 settings: forbidBroadOwns, screenPaths, maxScreensPerSlice, and maxPrProductLines defaults and validation', () => {
+  assert.equal(DEFAULT_CONFIG.forbidBroadOwns, true);
+  assert.deepEqual(DEFAULT_CONFIG.screenPaths, []);
+  assert.equal(DEFAULT_CONFIG.maxScreensPerSlice, 2);
+  assert.equal(DEFAULT_CONFIG.maxPrProductLines, 700);
+
+  const ok = mergeConfig({ forbidBroadOwns: false, screenPaths: ['apps/mobile/app/'], maxScreensPerSlice: 3, maxPrProductLines: 0 });
+  assert.equal(ok.forbidBroadOwns, false);
+  assert.deepEqual(ok.screenPaths, ['apps/mobile/app/']);
+  assert.equal(ok.maxScreensPerSlice, 3);
+  assert.equal(ok.maxPrProductLines, 0);
+  const off = mergeConfig({ maxScreensPerSlice: null, maxPrProductLines: null });
+  assert.equal(off.maxScreensPerSlice, null);
+  assert.equal(off.maxPrProductLines, null);
+
+  for (const bad of ['true', 1, null, []]) assert.throws(() => mergeConfig({ forbidBroadOwns: bad }), /wrong type/, `forbidBroadOwns=${JSON.stringify(bad)}`);
+  for (const bad of ['apps/', {}, null]) assert.throws(() => mergeConfig({ screenPaths: bad }), /wrong type/, `screenPaths=${JSON.stringify(bad)}`);
+  for (const bad of [[''], [3], ['/abs/app/'], ['../up/']]) assert.throws(() => mergeConfig({ screenPaths: bad }), /"screenPaths" must list/, JSON.stringify(bad));
+  for (const bad of [0, -1, 1.5]) assert.throws(() => mergeConfig({ maxScreensPerSlice: bad }), /"maxScreensPerSlice" must be a whole number/, `maxScreensPerSlice=${bad}`);
+  for (const bad of [-1, 2.5]) assert.throws(() => mergeConfig({ maxPrProductLines: bad }), /"maxPrProductLines" must be a whole number/, `maxPrProductLines=${bad}`);
+  for (const key of ['maxScreensPerSlice', 'maxPrProductLines']) {
+    for (const bad of ['3', true, [], {}]) assert.throws(() => mergeConfig({ [key]: bad }), /wrong type/, `${key}=${JSON.stringify(bad)}`);
+  }
+});
+
+test('5.3.2 broadClaim: a root, a folder above one, the repo root, or a wildcard is broad; a folder inside a root is not', () => {
+  const roots = ['apps/mobile/', 'apps/server/', 'packages/core/'];
+  for (const [entry, root] of [
+    ['apps/mobile/', 'apps/mobile/'], ['apps/mobile', 'apps/mobile/'], ['apps/server/', 'apps/server/'], ['apps/', 'apps/mobile/'],
+    ['packages/', 'packages/core/'], ['packages/core', 'packages/core/'], ['.', 'apps/mobile/'], ['./', 'apps/mobile/'], ['/', 'apps/mobile/'],
+    ['*', 'apps/mobile/'], ['**', 'apps/mobile/'], ['**/*.ts', 'apps/mobile/'], ['apps/*', 'apps/mobile/'], ['apps/mobile/**', 'apps/mobile/'],
+    ['APPS/Mobile/', 'apps/mobile/'],
+  ]) assert.equal(broadClaim(entry, roots), root, entry);
+  for (const entry of ['packages/core/locales/', 'apps/mobile/components/', 'apps/mobile/app.json', 'apps/mobile/components/**', 'apps/mobile2/', 'docs/notes.md']) {
+    assert.equal(broadClaim(entry, roots), null, entry);
+  }
+  assert.equal(broadClaim('apps/', []), null, 'no roots: nothing is broad');
+});
+
+test('5.3.2 broadClaim: a "*" anywhere in a part cuts the claim there; brackets in route names do not', () => {
+  const roots = ['apps/mobile/', 'apps/mobile/app/'];
+  for (const [entry, root] of [
+    ['apps/mobile/*.ts', 'apps/mobile/'], ['apps/mobile/**/*.ts', 'apps/mobile/'], ['apps/**/*.tsx', 'apps/mobile/'], ['*.ts', 'apps/mobile/'],
+    ['apps/*/src/', 'apps/mobile/'], ['apps/mobile/app/*.tsx', 'apps/mobile/app/'], ['apps/mobile/app/**/*.tsx', 'apps/mobile/app/'],
+    ['apps/mob*/app/', 'apps/mobile/'],
+  ]) assert.equal(broadClaim(entry, roots), root, entry);
+  for (const entry of ['apps/mobile/app/(tabs)/[id].tsx', 'apps/mobile/app/[slug]/', 'apps/mobile/app/(auth)/login.tsx', 'apps/mobile/components/*.tsx']) {
+    assert.equal(broadClaim(entry, roots), null, entry);
+  }
+  assert.deepEqual(screenClaims(['apps/mobile/app/(tabs)/[id].tsx', 'apps/mobile/app/*.tsx'], ['apps/mobile/app/']), ['apps/mobile/app/(tabs)/[id].tsx', 'apps/mobile/app/*.tsx']);
+});
+
+test('5.3.2 a screen root is a broad claim even when maxScreensPerSlice is null', () => {
+  const cfg = mergeConfig({ screenPaths: ['apps/mobile/app/'], maxScreensPerSlice: null });
+  for (const broad of ['apps/mobile/app/', 'apps/mobile/app/*.tsx', 'apps/mobile/app/**/*.tsx', 'apps/']) {
+    assert.ok(has(sizeCheck(sizeEntry(6, `[${broad}]`), cfg), `"owns" lists ${broad}, which claims all of apps/mobile/app/`), broad);
+  }
+  assert.deepEqual(sizeCheck(sizeEntry(6, '[apps/mobile/app/(tabs)/[id].tsx, apps/mobile/app/a.tsx, apps/mobile/app/b.tsx]'), cfg), [], 'no cap: three screens pass');
+});
+
+test('5.3.2 forbidBroadOwns: a new plan may not own a whole product root or a folder above one', () => {
+  const cfg = mergeConfig({ productPaths: ['apps/mobile/', 'apps/server/', 'packages/core/'] });
+  for (const broad of ['apps/mobile/', 'apps/server/', 'packages/', 'apps/', '.']) {
+    const errs = sizeCheck(sizeEntry(4, `[${broad}, apps/mobile/components/Card.tsx]`), cfg);
+    assert.ok(has(errs, `"owns" lists ${broad}, which claims all of`), `${broad}: ${errs.join('\n')}`);
+    assert.ok(has(errs, 'own the specific folders or files this slice changes'), errs.join('\n'));
+    assert.ok(has(errs, 'add slice 4 to "extraTaskSlices"'), errs.join('\n'));
+  }
+  // Specific folders strictly inside a product root pass.
+  assert.deepEqual(sizeCheck(sizeEntry(4, '[packages/core/locales/, apps/mobile/components/]'), cfg), []);
+  // forbidBroadOwns: false turns the check off; no productPaths means nothing to compare with.
+  assert.deepEqual(sizeCheck(sizeEntry(4, '[apps/mobile/]'), mergeConfig({ productPaths: ['apps/mobile/'], forbidBroadOwns: false })), []);
+  assert.deepEqual(sizeCheck(sizeEntry(4, '[apps/]'), mergeConfig({})), []);
+  // extraTaskSlices waives it, but only from the base branch when a base is given.
+  assert.deepEqual(sizeCheck(sizeEntry(4, '[apps/]'), mergeConfig({ productPaths: ['apps/mobile/'], extraTaskSlices: [4] })), []);
+  assert.ok(has(sizeCheck(sizeEntry(4, '[apps/]'), mergeConfig({ productPaths: ['apps/mobile/'], extraTaskSlices: [4] }), mergeConfig({ productPaths: ['apps/mobile/'] })), '"owns" lists apps/'));
+  // A lead branch cannot switch it off or drop the base branch's productPaths for its own new plan.
+  const base = mergeConfig({ productPaths: ['apps/mobile/'] });
+  assert.ok(has(sizeCheck(sizeEntry(4, '[apps/mobile/]'), mergeConfig({ forbidBroadOwns: false }), base), '"owns" lists apps/mobile/'));
+  assert.ok(has(sizeCheck(sizeEntry(4, '[apps/mobile/]'), mergeConfig({ productPaths: [] }), base), '"owns" lists apps/mobile/'));
+  // A plan already on the base branch is never broken by the new rule.
+  const old = sizeEntry(4, '[apps/]');
+  assert.deepEqual(checkNewPlans({ plans: [old], changes: [{ status: 'A', path: old.path }], readBase: (p) => (p === old.path ? 'x' : null), config: cfg }), []);
+});
+
+test('5.3.2 maxOwnsPerSlice defaults to 10: passes at 10, fails at 11, waived by extraTaskSlices, off with null', () => {
+  assert.deepEqual(sizeCheck(sizeEntry(5, ownsList(10))), []);
+  const errs = sizeCheck(sizeEntry(5, ownsList(11)));
+  assert.equal(errs.length, 1, errs.join('\n'));
+  assert.ok(errs[0].includes('new plan owns 11 paths (max 10)'), errs[0]);
+  assert.deepEqual(sizeCheck(sizeEntry(5, ownsList(11)), mergeConfig({ extraTaskSlices: [5] })), []);
+  assert.deepEqual(sizeCheck(sizeEntry(5, ownsList(11)), mergeConfig({ maxOwnsPerSlice: null })), []);
+  // Off on the branch but on (by default) on the base: the base's 10 still counts.
+  assert.ok(has(sizeCheck(sizeEntry(5, ownsList(11)), mergeConfig({ maxOwnsPerSlice: null }), mergeConfig({})), 'new plan owns 11 paths (max 10)'));
+});
+
+test('5.3.2 screen cap: at most maxScreensPerSlice owns entries inside screenPaths, and a screen root is broad', () => {
+  const cfg = mergeConfig({ screenPaths: ['apps/mobile/app/'] });
+  const screens = (n) => Array.from({ length: n }, (_, i) => `apps/mobile/app/screen${i + 1}.tsx`);
+  assert.deepEqual(screenClaims([...screens(2), 'apps/mobile/components/', 'apps/mobile/app2/x.tsx'], ['apps/mobile/app/']), screens(2));
+
+  assert.deepEqual(sizeCheck(sizeEntry(6, `[${screens(2).join(', ')}, apps/mobile/components/]`), cfg), []);
+  const errs = sizeCheck(sizeEntry(6, `[${screens(3).join(', ')}]`), cfg);
+  assert.equal(errs.length, 1, errs.join('\n'));
+  assert.ok(errs[0].includes('new plan owns 3 screen paths (max 2'), errs[0]);
+  assert.ok(errs[0].includes('split the slice so each one builds at most 2 screens'), errs[0]);
+  assert.ok(errs[0].includes('apps/mobile/app/screen3.tsx'), errs[0]);
+
+  // Waived by extraTaskSlices; skipped with no screenPaths; off with maxScreensPerSlice null.
+  assert.deepEqual(sizeCheck(sizeEntry(6, `[${screens(3).join(', ')}]`), mergeConfig({ screenPaths: ['apps/mobile/app/'], extraTaskSlices: [6] })), []);
+  assert.deepEqual(sizeCheck(sizeEntry(6, `[${screens(3).join(', ')}]`), mergeConfig({})), []);
+  assert.deepEqual(sizeCheck(sizeEntry(6, `[${screens(3).join(', ')}]`), mergeConfig({ screenPaths: ['apps/mobile/app/'], maxScreensPerSlice: null })), []);
+  // A higher cap on the branch does not beat the base branch's cap.
+  assert.ok(has(sizeCheck(sizeEntry(6, `[${screens(3).join(', ')}]`), mergeConfig({ screenPaths: ['apps/mobile/app/'], maxScreensPerSlice: 5 }), cfg), 'owns 3 screen paths (max 2'));
+
+  // The whole screen folder, or a folder above it, is a broad claim even with no productPaths.
+  for (const broad of ['apps/mobile/app/', 'apps/mobile/', 'apps/']) {
+    assert.ok(has(sizeCheck(sizeEntry(6, `[${broad}]`), cfg), `"owns" lists ${broad}, which claims all of apps/mobile/app/`), broad);
+  }
+  assert.deepEqual(sizeCheck(sizeEntry(6, '[apps/mobile/app/]'), mergeConfig({ screenPaths: ['apps/mobile/app/'], forbidBroadOwns: false })), []);
+});
+
+test('git: 5.3.2 broad owns and the screen cap are enforced by the checker on a lead branch', () => {
+  const root = makeRepo({ [CONFIG_FILE]: JSON.stringify({ productPaths: ['apps/mobile/'], screenPaths: ['apps/mobile/app/'] }) });
+  assert.ok(runChecker(root).ok);
+  git(root, 'checkout', '-qb', 'lead/plan-002');
+  const P2 = 'docs/plans/active/002-wide.md';
+  const plan2 = (owns) => logPlan({ id: 2 }).replace(LOG, 'docs/plans/logs/002-wide.md').replace('owns: none', `owns: ${owns}`);
+  write(root, 'docs/roadmap.md', `${ROADMAP_001}| 002 | Wide | [plan](plans/active/002-wide.md) |\n`);
+  write(root, P2, plan2('[apps/mobile/]'));
+  git(root, 'add', '-A');
+  const broad = runChecker(root, ['--staged']);
+  assert.ok(!broad.ok);
+  assert.ok(broad.out.includes(`${P2}: "owns" lists apps/mobile/, which claims all of apps/mobile/`), broad.out);
+
+  write(root, P2, plan2('[apps/mobile/app/a.tsx, apps/mobile/app/b.tsx, apps/mobile/app/c.tsx]'));
+  git(root, 'add', '-A');
+  const wide = runChecker(root, ['--staged']);
+  assert.ok(!wide.ok);
+  assert.ok(wide.out.includes(`${P2}: new plan owns 3 screen paths (max 2`), wide.out);
+
+  write(root, P2, plan2('[apps/mobile/app/a.tsx, apps/mobile/components/]'));
+  git(root, 'add', '-A');
+  const narrow = runChecker(root, ['--staged']);
+  assert.ok(narrow.ok, narrow.out);
 });

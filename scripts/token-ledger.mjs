@@ -2,11 +2,12 @@
 // token-ledger.mjs: shows how many AI tokens the agents spent, next to how much work got merged.
 //
 // What it does, in plain English:
-//   Every Claude Code and Codex thread leaves a transcript on this Mac: one line per event, and
+//   Every Claude Code, Codex, and Antigravity thread leaves a transcript on this Mac: one line per event, and
 //   each model reply line says how many tokens it used. This script:
 //   1. finds the transcripts for this project (Claude: ~/.claude/projects/<dir with the project
 //      key in its name>; Codex: ~/.codex/sessions and ~/.codex/archived_sessions, sessions whose
-//      working folder contains the project key);
+//      working folder contains the project key; Antigravity: ~/.t3/userdata/providers/antigravity,
+//      sessions whose workspace or first prompt contains the project key);
 //   2. reads each file one line at a time (never the whole file) and keeps only numbers: turns,
 //      tokens per day, start-up load (the context size on the first turn, paid before any work),
 //      peak context, context at the last turn, how many times the tool summarized (shrank) the
@@ -27,12 +28,13 @@
 // How to run (from the repo root):
 //   node scripts/token-ledger.mjs [--days 7] [--project unilex] [--run docs/runs/<name>.json]
 //                                 [--json] [--html out.html] [--cache file.json | --no-cache]
-//   Env overrides (the tests use them): LEDGER_CLAUDE_DIR (default ~/.claude/projects) and
-//   LEDGER_CODEX_DIR (default ~/.codex, which holds sessions/ and archived_sessions/).
+//   Env overrides (the tests use them): LEDGER_CLAUDE_DIR (default ~/.claude/projects),
+//   LEDGER_CODEX_DIR (default ~/.codex, which holds sessions/ and archived_sessions/), and
+//   LEDGER_ANTIGRAVITY_DIR (default ~/.t3/userdata/providers/antigravity).
 //   Exit 0 on success, 1 when the run file cannot be read, 2 on wrong usage.
 
 import { execFileSync } from 'node:child_process';
-import { createReadStream, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -42,7 +44,7 @@ import { BLOCK_LOG_FILE, isPaperwork, settings } from './merge-pr.mjs';
 import { RECEIPT_DIR } from './receipt.mjs';
 import { readRun } from './run-file.mjs';
 
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 5;
 const LIMITS = { turns: 150, peak: 200_000, sleeps: 10 };
 const M = (n) => (n / 1e6).toFixed(1);
 const K = (n) => `${Math.round(n / 1e3)}k`;
@@ -63,12 +65,71 @@ export function median(values) {
   return a.length ? a[Math.floor(a.length / 2)] : 0;
 }
 
+const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const normPath = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
+
+function isWorktreePath(pathStr, worktrees) {
+  if (!pathStr || !worktrees) return false;
+  const norm = normPath(pathStr).toLowerCase();
+  if (!norm) return false;
+  for (const wt of worktrees) {
+    const w = normPath(wt).toLowerCase();
+    if (w && (norm === w || norm.startsWith(`${w}/`))) return true;
+  }
+  return false;
+}
+
+export function gitWorktreePaths(cwd) {
+  let out;
+  try {
+    out = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return [];
+  }
+  const paths = new Set();
+  const add = (p) => {
+    paths.add(p);
+    if (process.platform === 'darwin' && /^\/private\/(?:tmp|var)(?:\/|$)/.test(p)) {
+      paths.add(p.slice('/private'.length));
+    }
+  };
+  for (const line of out.split(/\r?\n/)) {
+    if (!line.startsWith('worktree ')) continue;
+    const raw = line.slice('worktree '.length).trim();
+    if (!raw) continue;
+    const abs = resolve(cwd, raw);
+    add(abs);
+    try {
+      add(realpathSync(abs));
+    } catch {
+      // worktree folder may be pruned or missing on disk
+    }
+  }
+  return [...paths];
+}
+
+export function pathMatchesProject(pathStr, projectKey, worktrees = []) {
+  if (!pathStr) return false;
+  if (isWorktreePath(pathStr, worktrees)) return true;
+  if (!projectKey) return false;
+  return new RegExp(`(?:^|[\\\\/])${escapeRe(projectKey)}(?:[\\\\/]|$)`, 'i').test(String(pathStr));
+}
+
+function textMatchesProject(text, projectKey) {
+  if (!text || !projectKey) return false;
+  return new RegExp(`(?:^|[^a-z0-9_-])${escapeRe(projectKey)}(?:$|[^a-z0-9_-])`, 'i').test(String(text));
+}
+
 // The role of a thread, from its first user message. One place for every pattern.
 export function classifyRole(text) {
   const t = String(text || '').replace(/\*\*/g, '');
   // "You are the <Project> head agent" is the kit's own start line (template/AGENTS.md); the other two are UniLex's.
-  if (/^\s*(You are the (\S+ )?head agent|Start working on the next slice|Context handoff)/.test(t)) return 'head';
-  if (/\breviewer\b|review sub-agent|code auditor|audit worker/i.test(t)) return 'reviewer';
+  if (/^\s*(?:You are the (?:(?!not\b)[A-Za-z0-9._'\u2019-]+\s+){0,2}head agent\b|Start working on the next slice|Context handoff)/i.test(t)) return 'head';
+  if (/\breviewer\b|review sub-agent|code auditor|audit worker|\bblind neon\b/i.test(t)) return 'reviewer';
   if (/\bbuilder\b|implementation sub-agent|test sub-agent/i.test(t)) return 'builder';
   return 'other';
 }
@@ -112,15 +173,79 @@ export function defaultClaudeDirs(env = process.env, home = homedir()) {
   return dirs;
 }
 
-async function* lines(path) {
-  const rl = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (!line) continue;
-    try {
-      yield JSON.parse(line);
-    } catch {
-      // a half-written last line: skip it
+// Default Antigravity transcript root on this Mac: ~/.t3/userdata/providers/antigravity.
+// When LEDGER_ANTIGRAVITY_DIR is set, only that folder is used. If LEDGER_ANTIGRAVITY_DIR is unset
+// while LEDGER_CLAUDE_DIR or LEDGER_CODEX_DIR is set (test isolation), return no default folders.
+export function defaultAntigravityDirs(env = process.env, home = homedir()) {
+  if (env.LEDGER_ANTIGRAVITY_DIR) return [env.LEDGER_ANTIGRAVITY_DIR];
+  if (env.LEDGER_CLAUDE_DIR || env.LEDGER_CODEX_DIR) return [];
+  return [join(home, '.t3', 'userdata', 'providers', 'antigravity')];
+}
+
+export function findAntigravityFiles(dirs) {
+  const roots = Array.isArray(dirs) ? dirs : dirs ? [dirs] : [];
+  const out = [];
+  const seen = new Set();
+  const skipDirs = new Set(['worktrees', 'node_modules', '.git', 'chunks', 'media']);
+  const add = (p) => {
+    if (!seen.has(p) && existsSync(p)) {
+      seen.add(p);
+      out.push(p);
     }
+  };
+  const listDirs = (dir) => {
+    try {
+      return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !skipDirs.has(e.name));
+    } catch {
+      return [];
+    }
+  };
+  const addBrain = (brainDir) => {
+    for (const conv of listDirs(brainDir)) {
+      add(join(brainDir, conv.name, '.system_generated', 'logs', 'transcript.jsonl'));
+    }
+  };
+  for (const rootDir of roots) {
+    if (!rootDir) continue;
+    let entries;
+    try {
+      entries = readdirSync(rootDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (skipDirs.has(e.name)) continue;
+        const sub = join(rootDir, e.name);
+        if (e.name === 'brain') {
+          addBrain(sub);
+        } else {
+          add(join(sub, '.system_generated', 'logs', 'transcript.jsonl'));
+          addBrain(join(sub, 'antigravity-acp', 'brain'));
+        }
+      } else if (e.name.endsWith('.jsonl') && e.name !== 'transcript_full.jsonl') {
+        add(join(rootDir, e.name));
+      }
+    }
+  }
+  return out;
+}
+
+async function* lines(path) {
+  const stream = createReadStream(path);
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (!line) continue;
+      try {
+        yield JSON.parse(line);
+      } catch {
+        // a half-written last line: skip it
+      }
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
   }
 }
 
@@ -206,7 +331,7 @@ export async function parseClaudeFile(path) {
 // Codex: each token_count event carries last_token_usage (one model call) and a running total.
 // The same event can repeat; a call counts only when the running total moves.
 // Codex input_tokens already includes the cached part.
-export async function parseCodexFile(path, projectKey) {
+export async function parseCodexFile(path, projectKey, worktrees = []) {
   let cwd = null;
   let branch = null;
   let start = null;
@@ -239,7 +364,7 @@ export async function parseCodexFile(path, projectKey) {
     }
     if (first) {
       first = false;
-      if (projectKey && !String(cwd || '').includes(projectKey)) return { tool: 'codex', skip: true, cwd };
+      if (projectKey && !pathMatchesProject(cwd, projectKey, worktrees)) return { tool: 'codex', skip: true, cwd };
     }
     if (j.type === 'turn_context' && p.model) model = p.model;
     if (j.type === 'event_msg' && p.type === 'thread_settings_applied' && p.thread_settings?.model) model = p.thread_settings.model;
@@ -275,6 +400,280 @@ export async function parseCodexFile(path, projectKey) {
   };
 }
 
+function extractAntigravityCwd(text) {
+  const s = String(text || '');
+  const cmdDir = s.match(/Command Working Directory:\s*([^\r\n]+)/i);
+  if (cmdDir) return cmdDir[1].trim();
+  const activeWs = s.match(/Active Workspaces:\s*\r?\n\s*-\s*([^\r\n]+)/i);
+  if (activeWs) return activeWs[1].trim();
+  return null;
+}
+
+function cleanAntigravityUserText(text) {
+  return String(text || '')
+    .replace(/<t3_code_instructions>[\s\S]*?<\/t3_code_instructions>/gi, '')
+    .replace(/<user_information>[\s\S]*?<\/user_information>/gi, '')
+    .replace(/<runtime_info>[\s\S]*?<\/runtime_info>/gi, '')
+    .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '')
+    .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, '')
+    .replace(/^The following is a <SYSTEM_MESSAGE>[\s\S]*?<SYSTEM_MESSAGE>\s*/i, '')
+    .replace(/<\/?SYSTEM_MESSAGE>/gi, '')
+    .replace(/<\/?user_request>/gi, '')
+    .trim()
+    .replace(/^\[Message\][^\r\n]*?\bcontent=/i, '')
+    .replace(/^\[T3 Code:[^\]]*\]\s*/i, '')
+    .trim();
+}
+
+function antigravitySessionId(path) {
+  const base = basename(path, '.jsonl');
+  if (base !== 'transcript') return base;
+  const m = path.match(/[/\\]([^/\\]+)[/\\]\.system_generated[/\\]/);
+  if (m) return m[1];
+  const parent = basename(dirname(path));
+  return parent && parent !== '.' && parent !== 'logs' ? parent : base;
+}
+
+async function readFirstFullInput(path, kind = 'user') {
+  const fullPath = join(dirname(path), 'transcript_full.jsonl');
+  if (basename(path) !== 'transcript.jsonl' || !existsSync(fullPath)) return null;
+  for await (const j of lines(fullPath)) {
+    if (kind === 'user' && (j.type === 'USER_INPUT' || j.source === 'USER_EXPLICIT') && typeof j.content === 'string' && j.content.trim()) {
+      return j.content;
+    }
+    if (kind === 'system' && j.type === 'SYSTEM_MESSAGE' && typeof j.content === 'string' && j.content.trim()) {
+      return j.content;
+    }
+  }
+  return null;
+}
+
+const PATH_ARG_KEYS = ['Path', 'path', 'cwd', 'Cwd', 'file_path', 'filePath', 'Directory', 'directory', 'SearchPath', 'searchPath', 'TargetFile', 'targetFile'];
+const IGNORED_PATH_RE = /\/(?:\.t3\/userdata|\.claude|\.codex|\.gemini)\/|^(?:\/tmp|\/var|\/private\/tmp|\/private\/var|\/dev|\/usr|\/bin|\/sbin|\/etc|\/System|\/Library|\/opt)(?:\/|$)/;
+
+function unquoteArg(v) {
+  if (typeof v !== 'string') return '';
+  const s = v.trim();
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(s);
+      if (typeof parsed === 'string') return parsed.trim();
+    } catch {
+      return s.slice(1, -1).trim();
+    }
+  }
+  return s;
+}
+
+function extractToolPaths(toolCalls, out, worktrees = []) {
+  if (!Array.isArray(toolCalls)) return;
+  for (const tc of toolCalls) {
+    const args = tc?.args ?? tc?.arguments ?? {};
+    if (!args || typeof args !== 'object') continue;
+    for (const k of PATH_ARG_KEYS) {
+      const val = unquoteArg(args[k]);
+      if (val.startsWith('/') && (!IGNORED_PATH_RE.test(val) || isWorktreePath(val, worktrees))) out.push(val);
+    }
+    const cmd = unquoteArg(args.CommandLine ?? args.command);
+    if (cmd) {
+      for (const m of cmd.matchAll(/(?:^|[\s"'=])(\/[A-Za-z0-9._@+-]+(?:\/[A-Za-z0-9._@+-]+)+)/g)) {
+        if (!IGNORED_PATH_RE.test(m[1]) || isWorktreePath(m[1], worktrees)) out.push(m[1]);
+      }
+    }
+  }
+}
+
+const GENERIC_DIR_RE = /^(?:\/|\/(?:tmp|private\/tmp)|\/(?:Users|home)(?:\/[^/]+(?:\/(?:\.t3|dev|code|projects|src|repos|work|workspace|Desktop|Documents|Downloads))?)?)$|(?:^|\/)(?:\.t3\/worktrees|worktrees)\/?$/i;
+
+function toolPathDir(p, worktrees = []) {
+  const clean = String(p || '').replace(/\/+$/, '');
+  if (!clean.startsWith('/')) return null;
+  if (worktrees) {
+    const lower = clean.toLowerCase();
+    let best = null;
+    for (const wt of worktrees) {
+      const w = normPath(wt);
+      if (!w) continue;
+      const wl = w.toLowerCase();
+      if ((lower === wl || lower.startsWith(`${wl}/`)) && (!best || w.length > best.length)) best = w;
+    }
+    if (best) return best;
+  }
+  const wt = clean.match(/^(.*?\/\.t3\/worktrees\/[^/]+\/[^/]+)(?:\/|$)/);
+  if (wt) return wt[1];
+  const base = basename(clean);
+  const dir = base.includes('.') ? dirname(clean) : clean;
+  return GENERIC_DIR_RE.test(dir) ? null : dir;
+}
+
+function commonDirPrefix(dirs) {
+  if (!dirs.length) return null;
+  let parts = dirs[0].split('/').filter(Boolean);
+  for (let i = 1; i < dirs.length && parts.length; i++) {
+    const next = dirs[i].split('/').filter(Boolean);
+    let k = 0;
+    while (k < parts.length && k < next.length && parts[k] === next[k]) k++;
+    parts = parts.slice(0, k);
+  }
+  return parts.length ? `/${parts.join('/')}` : '/';
+}
+
+function inferCwdFromToolPaths(toolPaths, worktrees = []) {
+  let candidates = toolPaths.map((p) => toolPathDir(p, worktrees)).filter(Boolean);
+  if (!candidates.length) return null;
+  let lcp = commonDirPrefix(candidates);
+  while (lcp && GENERIC_DIR_RE.test(lcp)) {
+    const prefixDepth = lcp.split('/').filter(Boolean).length;
+    const clusters = new Map();
+    for (const d of candidates) {
+      const parts = d.split('/').filter(Boolean);
+      if (parts.length <= prefixDepth) continue;
+      const key = `/${parts.slice(0, prefixDepth + 1).join('/')}`;
+      const list = clusters.get(key) || [];
+      list.push(d);
+      clusters.set(key, list);
+    }
+    if (clusters.size <= 1) break;
+    let best = null;
+    for (const list of clusters.values()) {
+      if (!best || list.length > best.length) best = list;
+    }
+    candidates = best;
+    lcp = commonDirPrefix(candidates);
+  }
+  if (lcp && !GENERIC_DIR_RE.test(lcp)) return lcp;
+  const counts = {};
+  for (const d of candidates) counts[d] = (counts[d] || 0) + 1;
+  return topKey(counts);
+}
+
+function extractChildIds(j, selfId, outSet) {
+  if (j.type === 'USER_INPUT' || j.type === 'SYSTEM_MESSAGE') return;
+  for (const field of [j.content, j.output, j.tool_result]) {
+    if (!field) continue;
+    const text = typeof field === 'string' ? field : JSON.stringify(field);
+    if (!text.includes('conversationId')) continue;
+    for (const m of text.matchAll(/"conversationId"\s*:\s*"([a-z0-9_-]+)"/gi)) {
+      if (m[1] && m[1] !== selfId) outSet.add(m[1]);
+    }
+  }
+}
+
+// Antigravity: each model step reports input_tokens (uncached) + cache_read_tokens (cached) as ctx,
+// plus output_tokens. Compactions have no marker line, so a drop from > 80k to < 60% of previous ctx
+// counts as one summary.
+export async function parseAntigravityFile(path, projectKey = null, opts = {}) {
+  const worktrees = opts.worktrees || [];
+  const id = antigravitySessionId(path);
+  let cwd = null;
+  let branch = null;
+  let start = null;
+  let last = null;
+  let model = null;
+  let firstUserRaw = null;
+  let firstUserTruncated = false;
+  let firstSystemRaw = null;
+  let firstSystemTruncated = false;
+  let sleeps = 0;
+  const days = {};
+  const models = {};
+  const childIdSet = new Set();
+  const toolPaths = [];
+  let turns = 0;
+  let total = 0;
+  let startup = 0;
+  let peak = 0;
+  let lastSize = 0;
+  let prevCtx = 0;
+  let summaries = 0;
+  const turnLog = [];
+  for await (const j of lines(path)) {
+    const ts = j.created_at || j.timestamp || null;
+    if (ts && !start) start = ts;
+    if (ts) last = ts;
+    if (j.cwd && !cwd) cwd = j.cwd;
+    if (j.gitBranch || j.branch) branch = j.gitBranch || j.branch;
+    if (firstUserRaw === null && (j.type === 'USER_INPUT' || j.source === 'USER_EXPLICIT') && typeof j.content === 'string' && j.content.trim()) {
+      firstUserRaw = j.content;
+      firstUserTruncated = Array.isArray(j.truncated_fields) && j.truncated_fields.includes('content');
+    }
+    if (firstSystemRaw === null && j.type === 'SYSTEM_MESSAGE' && typeof j.content === 'string' && j.content.trim()) {
+      firstSystemRaw = j.content;
+      firstSystemTruncated = Array.isArray(j.truncated_fields) && j.truncated_fields.includes('content');
+    }
+    extractChildIds(j, id, childIdSet);
+    if (Array.isArray(j.tool_calls)) {
+      extractToolPaths(j.tool_calls, toolPaths, worktrees);
+      for (const tc of j.tool_calls) {
+        if (tc?.name === 'run_command') {
+          const cmd = tc.args?.CommandLine ?? tc.arguments?.CommandLine ?? '';
+          if (/\bsleep\b/.test(String(cmd))) sleeps++;
+        }
+      }
+    }
+    const input = j.input_tokens || 0;
+    const cacheRead = j.cache_read_tokens || 0;
+    const output = j.output_tokens || 0;
+    const ctx = input + cacheRead;
+    const tokens = ctx + output;
+    if (tokens > 0) {
+      if (ctx > 0) {
+        if (prevCtx > 80_000 && ctx < prevCtx * 0.6) summaries++;
+        prevCtx = ctx;
+      }
+      turns++;
+      total += tokens;
+      if (turns === 1) startup = ctx;
+      peak = Math.max(peak, ctx);
+      lastSize = ctx;
+      if (j.model) {
+        model = j.model;
+        models[j.model] = (models[j.model] || 0) + tokens;
+      }
+      addDay(days, ts, tokens);
+      turnLog.push([Date.parse(ts), tokens, branch]);
+    }
+  }
+  const useUser = firstUserRaw !== null;
+  let promptRaw = useUser ? firstUserRaw : firstSystemRaw;
+  const promptTruncated = useUser ? firstUserTruncated : firstSystemTruncated;
+  if (promptTruncated) {
+    const fullContent = await readFirstFullInput(path, useUser ? 'user' : 'system');
+    if (fullContent) promptRaw = fullContent;
+  }
+  if (!cwd && promptRaw) cwd = extractAntigravityCwd(promptRaw);
+  if (!cwd && toolPaths.length) cwd = inferCwdFromToolPaths(toolPaths, worktrees);
+  const firstUser = promptRaw ? cleanAntigravityUserText(promptRaw).slice(0, 2000) : null;
+  const matchProject = opts.matchProject ?? projectKey;
+  const promptMatch = matchProject ? textMatchesProject(firstUser, matchProject) : false;
+  if (projectKey) {
+    const matched = cwd ? pathMatchesProject(cwd, projectKey, worktrees) : promptMatch;
+    if (!matched) return { tool: 'antigravity', skip: true, cwd };
+  }
+  const summary = {
+    tool: 'antigravity',
+    id,
+    model: topKey(models) || model,
+    start,
+    turns,
+    startup,
+    peak,
+    total,
+    days,
+    role: classifyRole(firstUser),
+    slice: sliceId(branch, cwd, firstUser),
+    sleeps,
+    cwd,
+    last,
+    lastSize,
+    summaries,
+    turnLog,
+    childIds: [...childIdSet],
+  };
+  if (opts.matchProject) summary.promptMatch = promptMatch;
+  return summary;
+}
+
 // ---- finding files and the cache ----
 
 function walk(dir, out = []) {
@@ -292,9 +691,17 @@ function walk(dir, out = []) {
   return out;
 }
 
-export function findFiles({ claudeDir, claudeDirs, codexDir, project }) {
+const claudeSlug = (p) => normPath(p).replace(/[^a-zA-Z0-9-]/g, '-').toLowerCase();
+
+export function findFiles({ claudeDir, claudeDirs, codexDir, antigravityDir, antigravityDirs, project, worktrees = [] }) {
   const claude = [];
   const roots = Array.isArray(claudeDirs) ? claudeDirs : Array.isArray(claudeDir) ? claudeDir : claudeDir ? [claudeDir] : [];
+  const wtSlugs = [...(worktrees || [])].map(claudeSlug).filter(Boolean);
+  const claudeDirMatches = (name) => {
+    if (project && name.includes(project)) return true;
+    const lower = name.toLowerCase();
+    return wtSlugs.some((slug) => lower === slug || lower.startsWith(`${slug}-`));
+  };
   for (const rootDir of roots) {
     let dirs = [];
     try {
@@ -302,39 +709,69 @@ export function findFiles({ claudeDir, claudeDirs, codexDir, project }) {
     } catch {
       // no Claude folder: nothing to read
     }
-    for (const d of dirs) if (d.isDirectory() && d.name.includes(project)) walk(join(rootDir, d.name), claude);
+    for (const d of dirs) if (d.isDirectory() && claudeDirMatches(d.name)) walk(join(rootDir, d.name), claude);
   }
   const seen = new Set();
   const codex = [];
-  for (const sub of ['sessions', 'archived_sessions']) {
-    for (const f of walk(join(codexDir, sub))) {
-      if (!/^rollout-.*\.jsonl$/.test(basename(f)) || seen.has(basename(f))) continue;
-      seen.add(basename(f));
-      codex.push(f);
+  if (codexDir) {
+    for (const sub of ['sessions', 'archived_sessions']) {
+      for (const f of walk(join(codexDir, sub))) {
+        if (!/^rollout-.*\.jsonl$/.test(basename(f)) || seen.has(basename(f))) continue;
+        seen.add(basename(f));
+        codex.push(f);
+      }
     }
   }
-  return { claude, codex };
+  const agyRoots = Array.isArray(antigravityDirs)
+    ? antigravityDirs
+    : Array.isArray(antigravityDir)
+      ? antigravityDir
+      : antigravityDir
+        ? [antigravityDir]
+        : [];
+  const antigravity = findAntigravityFiles(agyRoots);
+  return { claude, codex, antigravity };
 }
 
-function readCache(file, project) {
+function normalizeWorktrees(worktrees = []) {
+  return [...new Set([...(worktrees || [])].map((w) => normPath(w)).filter(Boolean))].sort();
+}
+
+function readCache(file, project, worktreeKey = []) {
   if (!file || !existsSync(file)) return {};
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
-    // A cache written for another project holds that project's Codex filter results: never reuse it.
-    return c && c.version === CACHE_VERSION && c.project === project && c.files && typeof c.files === 'object' ? c.files : {};
+    // A cache written for another project or worktree set holds that set's Codex and Antigravity filter results: never reuse it.
+    if (
+      c &&
+      c.version === CACHE_VERSION &&
+      c.project === project &&
+      Array.isArray(c.worktrees) &&
+      JSON.stringify(normalizeWorktrees(c.worktrees)) === JSON.stringify(worktreeKey) &&
+      c.files &&
+      typeof c.files === 'object'
+    ) {
+      return c.files;
+    }
+    return {};
   } catch {
     return {}; // corrupt cache: ignore it and rebuild
   }
 }
 
 // Summaries for every transcript; only new or changed files are parsed.
-export async function loadSessions({ claudeDir, claudeDirs, codexDir, project, cacheFile = null }) {
-  const old = readCache(cacheFile, project);
+export async function loadSessions({ claudeDir, claudeDirs, codexDir, antigravityDir, antigravityDirs, project, worktrees = [], cacheFile = null }) {
+  const worktreeKey = normalizeWorktrees(worktrees);
+  const old = readCache(cacheFile, project, worktreeKey);
   const fresh = {};
   let parsed = 0;
   let reused = 0;
-  const { claude, codex } = findFiles({ claudeDir, claudeDirs, codexDir, project });
-  const jobs = [...claude.map((f) => [f, 'claude']), ...codex.map((f) => [f, 'codex'])];
+  const { claude, codex, antigravity } = findFiles({ claudeDir, claudeDirs, codexDir, antigravityDir, antigravityDirs, project, worktrees });
+  const jobs = [
+    ...claude.map((f) => [f, 'claude']),
+    ...codex.map((f) => [f, 'codex']),
+    ...antigravity.map((f) => [f, 'antigravity']),
+  ];
   for (const [file, tool] of jobs) {
     let st;
     try {
@@ -350,14 +787,67 @@ export async function loadSessions({ claudeDir, claudeDirs, codexDir, project, c
       reused++;
       continue;
     }
-    const summary = tool === 'claude' ? await parseClaudeFile(file) : await parseCodexFile(file, project);
+    const summary =
+      tool === 'claude'
+        ? await parseClaudeFile(file)
+        : tool === 'codex'
+          ? await parseCodexFile(file, project, worktrees)
+          : await parseAntigravityFile(file, null, { matchProject: project, worktrees });
     fresh[file] = { size: st.size, mtimeMs: st.mtimeMs, summary };
     parsed++;
   }
-  if (cacheFile) writeFileSync(cacheFile, JSON.stringify({ version: CACHE_VERSION, project, files: fresh }));
-  const sessions = Object.values(fresh)
-    .map((x) => x.summary)
-    .filter((s) => s && !s.skip && s.turns > 0);
+  if (cacheFile) writeFileSync(cacheFile, JSON.stringify({ version: CACHE_VERSION, project, worktrees: worktreeKey, files: fresh }));
+  const agyById = new Map();
+  const childToParent = new Map();
+  for (const { summary: s } of Object.values(fresh)) {
+    if (s && s.tool === 'antigravity' && !s.skip && s.id) agyById.set(s.id, s);
+  }
+  for (const s of agyById.values()) {
+    for (const cid of s.childIds || []) {
+      if (cid && cid !== s.id && !childToParent.has(cid)) childToParent.set(cid, s.id);
+    }
+  }
+  const resolveAgy = (s) => {
+    let cwd = s.cwd || null;
+    let slice = s.slice || null;
+    let promptMatch = Boolean(s.promptMatch);
+    const seenIds = new Set([s.id]);
+    let curId = childToParent.get(s.id);
+    while (curId && !seenIds.has(curId)) {
+      seenIds.add(curId);
+      const parent = agyById.get(curId);
+      if (!parent) break;
+      const ownCwd = cwd;
+      if (!cwd && parent.cwd) cwd = parent.cwd;
+      if (!slice && parent.slice && (!ownCwd || !parent.cwd || !project || pathMatchesProject(ownCwd, project, worktrees) === pathMatchesProject(parent.cwd, project, worktrees))) {
+        slice = parent.slice;
+      }
+      if (!cwd && !promptMatch && parent.promptMatch) promptMatch = true;
+      if (cwd && slice) break;
+      curId = childToParent.get(curId);
+    }
+    return { cwd, slice, promptMatch };
+  };
+  const sessions = [];
+  for (const { summary: s } of Object.values(fresh)) {
+    if (!s || s.skip || !(s.turns > 0)) continue;
+    if (s.tool === 'claude') {
+      if (project && s.cwd && !pathMatchesProject(s.cwd, project, worktrees)) continue;
+      sessions.push(s);
+    } else if (s.tool === 'antigravity') {
+      const { cwd, slice, promptMatch } = resolveAgy(s);
+      if (project) {
+        const matched = cwd ? pathMatchesProject(cwd, project, worktrees) : promptMatch;
+        if (!matched) continue;
+      }
+      const out = { ...s, cwd, slice };
+      delete out.promptMatch;
+      sessions.push(out);
+    } else {
+      if (project && s.cwd && !pathMatchesProject(s.cwd, project, worktrees)) continue;
+      sessions.push(s);
+    }
+  }
   return { sessions, parsed, reused };
 }
 
@@ -417,23 +907,27 @@ export function buildReport({ sessions, prs, days = 7, now = new Date() }) {
   const perDay = dayList.map((date) => {
     let claude = 0;
     let codex = 0;
+    let antigravity = 0;
     for (const s of sessions) {
       const t = s.days?.[date] || 0;
       if (s.tool === 'claude') claude += t;
+      else if (s.tool === 'antigravity') antigravity += t;
       else codex += t;
     }
+    const dayTokens = claude + codex + antigravity;
     const p = prs ? prs[date] || { code: 0, docs: 0 } : null;
     return {
       date,
       claude,
       codex,
+      antigravity,
       sessions: recent.filter((s) => localDate(s.start) === date).length,
       codePrs: p ? p.code : null,
       docsPrs: p ? p.docs : null,
-      perCodePr: p && p.code ? (claude + codex) / p.code : null,
+      perCodePr: p && p.code ? dayTokens / p.code : null,
     };
   });
-  const tokens = perDay.reduce((a, d) => a + d.claude + d.codex, 0);
+  const tokens = perDay.reduce((a, d) => a + d.claude + d.codex + d.antigravity, 0);
   const codePrs = prs ? perDay.reduce((a, d) => a + d.codePrs, 0) : null;
   const docsPrs = prs ? perDay.reduce((a, d) => a + d.docsPrs, 0) : null;
   const recentTotal = recent.reduce((a, s) => a + s.total, 0);
@@ -494,11 +988,11 @@ const pad = (cells, widths) => cells.map((c, i) => String(c).padStart(widths[i])
 
 export function renderText(r) {
   const out = [];
-  out.push(`Tokens, last ${r.days} days (${r.from} to ${r.to}): ${M(r.tokens)}M (Claude Code + Codex only). Merged PRs: ${na(r.codePrs)} code, ${na(r.docsPrs)} docs-only. M tokens per code PR: ${na(r.perCodePr, M)}.`);
+  out.push(`Tokens, last ${r.days} days (${r.from} to ${r.to}): ${M(r.tokens)}M (Claude Code + Codex + Antigravity). Merged PRs: ${na(r.codePrs)} code, ${na(r.docsPrs)} docs-only. M tokens per code PR: ${na(r.perCodePr, M)}.`);
   out.push('');
-  const w1 = [10, 9, 9, 8, 8, 8, 10];
-  out.push(pad(['date', 'Claude M', 'Codex M', 'sessions', 'code PRs', 'docs PRs', 'M per code'], w1));
-  for (const d of r.perDay) out.push(pad([d.date, M(d.claude), M(d.codex), d.sessions, na(d.codePrs), na(d.docsPrs), na(d.perCodePr, M)], w1));
+  const w1 = [10, 9, 9, 8, 8, 8, 8, 10];
+  out.push(pad(['date', 'Claude M', 'Codex M', 'AGY M', 'sessions', 'code PRs', 'docs PRs', 'M per code'], w1));
+  for (const d of r.perDay) out.push(pad([d.date, M(d.claude), M(d.codex), M(d.antigravity || 0), d.sessions, na(d.codePrs), na(d.docsPrs), na(d.perCodePr, M)], w1));
   out.push('');
   out.push('By role (sessions started in the period):');
   const w2 = [8, 8, 12, 13, 12, 9, 6];
@@ -532,12 +1026,14 @@ function table(head, rows) {
 }
 
 export function renderHtml(r) {
-  const max = Math.max(1, ...r.perDay.map((d) => d.claude + d.codex));
+  const max = Math.max(1, ...r.perDay.map((d) => d.claude + d.codex + (d.antigravity || 0)));
   const bars = r.perDay
     .map((d) => {
+      const agy = d.antigravity || 0;
       const c = (100 * d.claude) / max;
       const x = (100 * d.codex) / max;
-      return `<div class="row"><span class="lbl">${esc(d.date.slice(5))}</span><div class="track"><div class="bar c1" style="width:${c.toFixed(2)}%"></div><div class="bar c2" style="width:${x.toFixed(2)}%"></div></div><span class="val">${M(d.claude + d.codex)}M</span></div>`;
+      const a = (100 * agy) / max;
+      return `<div class="row"><span class="lbl">${esc(d.date.slice(5))}</span><div class="track"><div class="bar c1" style="width:${c.toFixed(2)}%"></div><div class="bar c2" style="width:${x.toFixed(2)}%"></div><div class="bar c3" style="width:${a.toFixed(2)}%"></div></div><span class="val">${M(d.claude + d.codex + agy)}M</span></div>`;
     })
     .join('');
   const su = r.startup;
@@ -552,17 +1048,17 @@ h1{font-size:18px;margin:0 0 4px}h2{font-size:15px;margin:20px 0 8px}
 .legend span{display:inline-block;width:10px;height:10px;margin:0 4px 0 10px;vertical-align:middle}
 .row{display:flex;align-items:center;gap:8px;margin:3px 0}.lbl{width:44px;flex:none;font-variant-numeric:tabular-nums}
 .track{flex:1;display:flex;min-width:0;height:14px;border-bottom:1px solid var(--border,#ddd)}.val{width:64px;flex:none;text-align:right;font-variant-numeric:tabular-nums}
-.c1{background:var(--chart-1,#4f7cff)}.c2{background:var(--chart-2,#f59e0b)}
+.c1{background:var(--chart-1,#4f7cff)}.c2{background:var(--chart-2,#f59e0b)}.c3{background:var(--chart-3,#10b981)}
 .scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 th,td{text-align:right;padding:4px 6px;border-bottom:1px solid var(--border,#ddd);white-space:nowrap}th:first-child,td:first-child{text-align:left}
 ul{padding-left:18px}li{overflow-wrap:anywhere}
 </style></head><body>
 <h1>Token ledger</h1>
-<p>${esc(`Last ${r.days} days (${r.from} to ${r.to}): ${M(r.tokens)}M tokens (Claude Code + Codex only). Merged PRs: ${na(r.codePrs)} code, ${na(r.docsPrs)} docs-only. M tokens per code PR: ${na(r.perCodePr, M)}.`)}</p>
+<p>${esc(`Last ${r.days} days (${r.from} to ${r.to}): ${M(r.tokens)}M tokens (Claude Code + Codex + Antigravity). Merged PRs: ${na(r.codePrs)} code, ${na(r.docsPrs)} docs-only. M tokens per code PR: ${na(r.perCodePr, M)}.`)}</p>
 <h2>Tokens per day</h2>
-<p class="muted legend"><span class="c1"></span>Claude<span class="c2"></span>Codex</p>
+<p class="muted legend"><span class="c1"></span>Claude<span class="c2"></span>Codex<span class="c3"></span>Antigravity</p>
 ${bars}
-<div class="scroll">${table(['date', 'Claude M', 'Codex M', 'sessions', 'code PRs', 'docs PRs', 'M per code PR'], r.perDay.map((d) => [d.date, M(d.claude), M(d.codex), d.sessions, na(d.codePrs), na(d.docsPrs), na(d.perCodePr, M)]))}</div>
+<div class="scroll">${table(['date', 'Claude M', 'Codex M', 'AGY M', 'sessions', 'code PRs', 'docs PRs', 'M per code PR'], r.perDay.map((d) => [d.date, M(d.claude), M(d.codex), M(d.antigravity || 0), d.sessions, na(d.codePrs), na(d.docsPrs), na(d.perCodePr, M)]))}</div>
 <h2>By role</h2>
 <div class="scroll">${table(['role', 'sessions', 'median turns', 'median start-up', 'median peak', 'total M', 'share'], r.roles.map((x) => [x.role, x.sessions, x.medianTurns, K(x.medianStartup), K(x.medianPeak), M(x.total), `${Math.round(x.share * 100)}%`]))}</div>
 <h2>Top slices</h2>
@@ -570,7 +1066,7 @@ ${bars}
 <h2>Start-up load check</h2>
 <p>${esc(`Claude median first-turn context: last 24 hours ${K(su.last24h.median)} (${su.last24h.sessions} sessions), the 7 days before ${K(su.prior7d.median)} (${su.prior7d.sessions} sessions).`)}</p>
 <h2>Warnings</h2>
-<ul>${warnLine(`Over ${LIMITS.turns} turns`, w.longThreads)}${warnLine(`Peak context over ${K(LIMITS.peak)}`, w.bigContext)}${warnLine(`${LIMITS.sleeps} or more sleep calls`, w.sleepy)}</ul>
+<ul>${warnLine(`Over ${LIMITS.turns} turns`, w.longThreads)}${warnLine(`Peak context over ${K(LIMITS.peak)}`, w.bigContext)}${warnLine(`${LIMITS.sleeps} or more sleep calls`, w.sleepy)}${r.summarized ? warnLine('Threads summarized at least once', r.summarized) : ''}</ul>
 </body></html>
 `;
 }
@@ -805,12 +1301,18 @@ async function main() {
     console.error(`Wrong usage: ${e.message}\n${USAGE}`);
     process.exit(2);
   }
-  const project = o.project || projectKey(process.cwd());
+  const detectedProject = projectKey(process.cwd());
+  const project = o.project || detectedProject;
+  const worktrees = !o.project || o.project.toLowerCase() === detectedProject.toLowerCase()
+    ? gitWorktreePaths(process.cwd())
+    : [];
   const cacheFile = o.cache === undefined ? join(tmpdir(), `token-ledger-${project}.json`) : o.cache;
   const { sessions, parsed, reused } = await loadSessions({
     claudeDirs: defaultClaudeDirs(),
     codexDir: process.env.LEDGER_CODEX_DIR || join(homedir(), '.codex'),
+    antigravityDirs: defaultAntigravityDirs(),
     project,
+    worktrees,
     cacheFile,
   });
   const report = buildReport({ sessions, prs: mergedPrs(process.cwd()), days: o.days });

@@ -40,7 +40,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { baseCandidates, loadConfig } from './check-plans.mjs';
-import { RECEIPT_DIR, buildReceipt } from './receipt.mjs';
+import { RECEIPT_DIR, branchSlice, buildReceipt, receiptMatches, roundKey } from './receipt.mjs';
 import { REASON_DIR, reasonFile } from './test-changes.mjs';
 
 export const FINDINGS_DIR = 'docs/findings/';
@@ -159,27 +159,63 @@ export function findingsFor(root, { base, branch = 'HEAD', name, readFile = (p) 
   // The receipts the branch added, oldest first: receipt k is round k.
   const added = git(['diff', '--name-only', '-z', '--no-renames', '--diff-filter=A', fork.stdout.trim(), branch, '--', RECEIPT_DIR]);
   if (added.code !== 0) throw new Error(`cannot list the receipts ${branch} added: ${added.stderr.trim()}`);
+  const expectedSlice = branchSlice(name || branch);
   const notes = [];
   const unchecked = [];
-  const receipts = added.stdout.split('\0').filter((p) => p.endsWith('.json')).map((path) => {
+  const rawReceipts = added.stdout.split('\0').filter((p) => p.endsWith('.json')).map((path) => {
     try {
       const written = JSON.parse(textAt(branch, path));
       let receipt = written;
+      let checked = true;
       try {
         if (typeof written.session !== 'string' || !written.session) throw new Error('it names no session record');
         receipt = buildReceipt(readFile(written.session), written.session);
-        if (JSON.stringify(receipt) !== JSON.stringify(written)) notes.push(`${path} does not match its session record, so its counts are taken from the record. Make it again: node scripts/receipt.mjs make ${written.session}`);
+        if (!receiptMatches(receipt, written, expectedSlice)) notes.push(`${path} does not match its session record, so its counts are taken from the record. Make it again: node scripts/receipt.mjs make ${written.session}`);
       } catch (e) {
+        checked = false;
         unchecked.push(path);
         notes.push(`${path}: its session record cannot be read again (${e.message}), so its counts cannot be checked`);
       }
       const at = Date.parse(receipt.at);
       const counts = receipt.counts && typeof receipt.counts === 'object' ? Object.fromEntries(COUNT_KEYS.map((k) => [k, totalOf({ [k]: receipt.counts[k] })])) : null;
-      return { path, at: Number.isNaN(at) ? Infinity : at, counts };
+      const key = typeof receipt.task === 'string' && receipt.task && typeof receipt.at === 'string' && receipt.at ? roundKey(receipt) : null;
+      return { path, at: Number.isNaN(at) ? Infinity : at, counts, key, checked };
     } catch (e) {
       throw new Error(`the review receipt ${path} cannot be read (${e.message}). Make it again with node scripts/receipt.mjs make <session-file>.`);
     }
   });
+  // Deduplicate receipts that share the same review identity (task + at + model), keeping the newest path.
+  const keyCounts = new Map();
+  for (const r of rawReceipts) if (r.key) keyCounts.set(r.key, (keyCounts.get(r.key) || 0) + 1);
+  const hasDuplicates = [...keyCounts.values()].some((n) => n > 1);
+  let receipts = rawReceipts;
+  if (hasDuplicates) {
+    const recency = new Map();
+    const log = git(['log', '--name-only', '--format=format:COMMIT', `${fork.stdout.trim()}..${branch}`, '--', RECEIPT_DIR]);
+    if (log.code === 0) {
+      let rank = 0;
+      for (const rawLine of log.stdout.split('\n')) {
+        if (rawLine === 'COMMIT') { rank += 1; continue; }
+        const p = rawLine.trim();
+        if (p.endsWith('.json') && !recency.has(p)) recency.set(p, rank);
+      }
+    }
+    const isNewer = (cand, cur) => {
+      if (cand.checked !== cur.checked) return cand.checked;
+      const rCand = recency.get(cand.path) ?? Infinity;
+      const rCur = recency.get(cur.path) ?? Infinity;
+      if (rCand !== rCur) return rCand < rCur;
+      return cand.path > cur.path;
+    };
+    const byKey = new Map();
+    const unkeyed = [];
+    for (const r of rawReceipts) {
+      if (!r.key) { unkeyed.push(r); continue; }
+      const prev = byKey.get(r.key);
+      if (!prev || isNewer(r, prev)) byKey.set(r.key, r);
+    }
+    receipts = [...byKey.values(), ...unkeyed];
+  }
   receipts.sort((a, b) => (a.at === b.at ? (a.path < b.path ? -1 : 1) : a.at - b.at));
   const rounds = receipts.map((r, i) => ({ round: i + 1, receipt: r.path, counts: r.counts }));
 

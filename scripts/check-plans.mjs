@@ -53,9 +53,22 @@
 //   quickReviewPaths       folders and files a small change may touch and still get a quick review (default [])
 //   quickReviewMaxLines    most lines added plus removed for a quick review (default 50); both read by
 //                          scripts/review-level.mjs
-//   maxReviewRounds        most review rounds allowed per branch before scripts/receipt.mjs make stops
-//                          (default 10, warning at round 7; 0 turns the cap off; REV-6)
+//   maxReviewRounds        most review rounds allowed per slice before scripts/receipt.mjs make stops
+//                          (default 12, warning at round 8; 0 turns the cap off; REV-6)
+//   graceReviewRound       allow 1 convergence grace round past the cap when the prior round has
+//                          <= 2 important findings and converged (default true; REV-6)
 //   extraReviewRoundSlices slice ids the owner allowed past maxReviewRounds (read from the base branch)
+//   maxTasksPerSlice       most numbered tasks allowed in a new plan (default 3; null turns the cap off)
+//   maxOwnsPerSlice        most paths allowed in a new plan's "owns" list (default 10; null turns the cap off)
+//   forbidBroadOwns        refuse a new plan whose "owns" claims a whole productPaths or screenPaths root, or a
+//                          folder above one, like apps/, packages/, or "." (default true; false turns it off)
+//   screenPaths            folders that hold screens, like ["apps/mobile/app/"] (default [], and then no screen cap)
+//   maxScreensPerSlice     most "owns" entries inside screenPaths in a new plan (default 2; null turns the cap off)
+//   maxPrProductLines      lines of product code a pull request may add before scripts/merge-pr.mjs prints a
+//                          warning to split it (default 700; null or 0 turns the warning off). It never blocks.
+//   extraTaskSlices        slice ids the owner allowed past maxTasksPerSlice, maxOwnsPerSlice, forbidBroadOwns,
+//                          or maxScreensPerSlice (read from the base branch)
+//   maxTaskReviewRounds    most review rounds allowed per task before stopping (default 4; null turns the cap off)
 //   A "checks" entry may also carry "observe": true: the check runs and is recorded, but does not stop a merge.
 //   presets, productPaths, notYetClean  read by scripts/presets.mjs, scripts/switch-offs.mjs, and scripts/ratchets.mjs
 //
@@ -191,8 +204,17 @@ export const DEFAULT_CONFIG = Object.freeze({
   checkSettingsPaths: [],
   quickReviewPaths: [],
   quickReviewMaxLines: 50,
-  maxReviewRounds: 10,
+  maxReviewRounds: 12,
+  graceReviewRound: true,
   extraReviewRoundSlices: [],
+  maxTasksPerSlice: 3,
+  maxOwnsPerSlice: 10,
+  forbidBroadOwns: true,
+  screenPaths: [],
+  maxScreensPerSlice: 2,
+  maxPrProductLines: 700,
+  extraTaskSlices: [],
+  maxTaskReviewRounds: 4,
   snapshotPaths: [],
 });
 
@@ -252,6 +274,7 @@ export function loadConfig(root) {
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isText = (v) => typeof v === 'string' && v.length > 0;
+const NULLABLE_INT_KEYS = new Set(['maxTasksPerSlice', 'maxOwnsPerSlice', 'maxTaskReviewRounds', 'maxScreensPerSlice', 'maxPrProductLines']);
 
 export function mergeConfig(raw) {
   if (!isObject(raw)) throw new Error(`${CONFIG_FILE} must be a JSON object`);
@@ -262,8 +285,12 @@ export function mergeConfig(raw) {
   for (const [key, value] of Object.entries(raw)) {
     if (!(key in DEFAULT_CONFIG)) throw new Error(`${CONFIG_FILE} has unknown setting "${key}" (allowed: ${Object.keys(DEFAULT_CONFIG).join(', ')})`);
     const want = DEFAULT_CONFIG[key];
-    const ok = Array.isArray(want) ? Array.isArray(value) : typeof want === typeof value && value !== null && !Array.isArray(value);
-    if (!ok) bad(`"${key}" has the wrong type (expected ${Array.isArray(want) ? 'a list' : typeof want})`);
+    if (NULLABLE_INT_KEYS.has(key)) {
+      if (value !== null && typeof value !== 'number') bad(`"${key}" has the wrong type (expected number or null)`);
+    } else {
+      const ok = Array.isArray(want) ? Array.isArray(value) : typeof want === typeof value && value !== null && !Array.isArray(value);
+      if (!ok) bad(`"${key}" has the wrong type (expected ${Array.isArray(want) ? 'a list' : typeof want})`);
+    }
     if (key === 'models') {
       for (const k of Object.keys(value)) {
         if (!(k in DEFAULT_CONFIG.models)) bad(`"models" has unknown key "${k}" (allowed: ${Object.keys(DEFAULT_CONFIG.models).join(', ')})`);
@@ -277,15 +304,32 @@ export function mergeConfig(raw) {
     if (!config[key].endsWith('/')) bad(`"${key}" must end with "/", like "${DEFAULT_CONFIG[key]}"`);
   }
   if (config.leadPrefixes.some((p) => !isText(p) || !p.endsWith('/'))) bad('"leadPrefixes" must list prefixes that end with "/", like "lead/"');
-  for (const key of ['extraLeadOnly', 'emDashSkipDirs', 'paperworkPaths', 'presets', 'productPaths', 'notYetClean', 'highRiskPaths', 'checkSettingsPaths', 'snapshotPaths', 'quickReviewPaths']) {
+  for (const key of ['extraLeadOnly', 'emDashSkipDirs', 'paperworkPaths', 'presets', 'productPaths', 'notYetClean', 'highRiskPaths', 'checkSettingsPaths', 'snapshotPaths', 'quickReviewPaths', 'screenPaths']) {
     if (config[key].some((p) => !isText(p))) bad(`"${key}" must list paths (text, not empty)`);
   }
   if (config.sameModelReviewSlices.some((id) => !Number.isInteger(id))) bad('"sameModelReviewSlices" must list slice ids (whole numbers)');
   if (config.extraReviewRoundSlices.some((id) => !Number.isInteger(id))) bad('"extraReviewRoundSlices" must list slice ids (whole numbers)');
+  if (config.extraTaskSlices.some((id) => !Number.isInteger(id) || id < 0)) bad('"extraTaskSlices" must list slice ids (whole numbers, 0 or more)');
   if (!Number.isFinite(config.staleMinutes) || config.staleMinutes < 0) bad('"staleMinutes" must be a number of minutes, 0 or more');
   if (!Number.isInteger(config.planMaxBytes) || config.planMaxBytes < 1) bad('"planMaxBytes" must be a whole number of bytes, 1 or more');
   if (!Number.isInteger(config.quickReviewMaxLines) || config.quickReviewMaxLines < 0) bad('"quickReviewMaxLines" must be a whole number of lines, 0 or more');
   if (!Number.isInteger(config.maxReviewRounds) || config.maxReviewRounds < 0) bad('"maxReviewRounds" must be a whole number of rounds, 0 or more');
+  if (config.maxTasksPerSlice !== null && (!Number.isInteger(config.maxTasksPerSlice) || config.maxTasksPerSlice < 1)) {
+    bad('"maxTasksPerSlice" must be a whole number of tasks, 1 or more, or null to turn the cap off');
+  }
+  if (config.maxOwnsPerSlice !== null && (!Number.isInteger(config.maxOwnsPerSlice) || config.maxOwnsPerSlice < 1)) {
+    bad('"maxOwnsPerSlice" must be a whole number of paths, 1 or more, or null to turn the cap off');
+  }
+  if (config.maxScreensPerSlice !== null && (!Number.isInteger(config.maxScreensPerSlice) || config.maxScreensPerSlice < 1)) {
+    bad('"maxScreensPerSlice" must be a whole number of screen paths, 1 or more, or null to turn the cap off');
+  }
+  if (config.maxPrProductLines !== null && (!Number.isInteger(config.maxPrProductLines) || config.maxPrProductLines < 0)) {
+    bad('"maxPrProductLines" must be a whole number of lines, 0 or more, or null (0 and null turn the warning off)');
+  }
+  if (config.screenPaths.some((p) => ownPath(p) === null)) bad('"screenPaths" must list folders from the repo root, like "apps/mobile/app/"');
+  if (config.maxTaskReviewRounds !== null && (!Number.isInteger(config.maxTaskReviewRounds) || config.maxTaskReviewRounds < 1)) {
+    bad('"maxTaskReviewRounds" must be a whole number of rounds, 1 or more, or null to turn the cap off');
+  }
   // The other switches and their modes are checked by scripts/merge-pr.mjs. The claim check runs in a git hook,
   // which can only stop a commit or let it through, so it has no "observe" mode.
   if (config.features.claimCheck === 'observe') bad('"features.claimCheck" cannot be "observe": the claim check runs in a git hook, which cannot watch without stopping. Use "enforce" (or true) to turn it on, or "off" (or false)');
@@ -885,7 +929,7 @@ export function checkManifest(read) {
 // files: where to look, when the caller knows better than the disk (git does):
 //   { markdown: [paths], exists(path) -> true or false, read(path) -> bytes or null }.
 //   Any part left out falls back to reading the folder itself.
-export function checkRepo(root, { branch = '', kind = null, git = null, config = DEFAULT_CONFIG, files = null } = {}) {
+export function checkRepo(root, { branch = '', kind = null, git = null, config = DEFAULT_CONFIG, baseConfig = null, files = null } = {}) {
   const errors = [];
   const exists = files?.exists ?? ((p) => existsSync(join(root, p)));
   // A regular file (not a folder, link, or submodule) at exactly this path, letter case included, so disk
@@ -1008,7 +1052,7 @@ export function checkRepo(root, { branch = '', kind = null, git = null, config =
     } catch {
       facts = null;
     }
-    if (facts) errors.push(...checkNewPlans({ plans, config, invariantIds: invariants.optedIn ? invariants.ids : null, ...facts }));
+    if (facts) errors.push(...checkNewPlans({ plans, config, baseConfig, invariantIds: invariants.optedIn ? invariants.ids : null, ...facts }));
     if (facts?.claimCommits && claimCheckOn(config)) {
       errors.push(...checkClaims(facts.claimCommits()));
     }
@@ -1042,17 +1086,93 @@ const FIELD_HINTS = {
   owns: 'the paths this slice owns, like [src/search/], or none for a docs-only slice',
   proof: 'one line: what will be shown to prove it works',
 };
+// Stricter of the base branch's cap and the branch's cap: a positive integer beats null/undefined,
+// and two positive integers take the smaller one. Both null means the cap is off.
+function stricterCap(baseVal, branchVal) {
+  const baseNum = Number.isInteger(baseVal) && baseVal > 0 ? baseVal : null;
+  const branchNum = Number.isInteger(branchVal) && branchVal > 0 ? branchVal : null;
+  if (baseNum !== null && branchNum !== null) return Math.min(baseNum, branchNum);
+  return baseNum ?? branchNum;
+}
+
+// One "owns" entry as the folder it really claims, lower case for comparing: everything from the first
+// part with a "*" on is dropped, so "apps/*", "apps/**/*.tsx", and "apps/*/src/" claim apps, and
+// "apps/mobile/*.ts" claims apps/mobile. "" is the whole repo: ".", "/", "*", "*.ts", "**/*.ts".
+// Brackets and round brackets are plain name characters, as in "app/(tabs)/[id].tsx".
+// null: not a path at all (validatePlan reports that one).
+function claimRoot(p) {
+  const parts = String(p ?? '').trim().replace(/\\/g, '/').split('/').filter((x) => x && x !== '.');
+  const wild = parts.findIndex((x) => x.includes('*'));
+  if (wild >= 0) parts.length = wild;
+  if (!parts.length) return '';
+  return ownPath(parts.join('/'))?.toLowerCase() ?? null;
+}
+
+// The root an "owns" entry swallows whole: the first of roots that the entry equals or sits above
+// ("apps/" swallows "apps/mobile/"), or null. An entry strictly inside a root is fine.
+export function broadClaim(entry, roots) {
+  const claim = claimRoot(entry);
+  if (claim === null) return null;
+  return roots.find((r) => {
+    const root = ownPath(r)?.toLowerCase();
+    return Boolean(root) && (claim === '' || claim === root || root.startsWith(`${claim}/`));
+  }) ?? null;
+}
+
+// The "owns" entries that are inside a screen folder (or are one), so each counts as a screen.
+export function screenClaims(owns, screenPaths) {
+  const roots = screenPaths.map((r) => ownPath(r)?.toLowerCase()).filter(Boolean);
+  return owns.filter((entry) => {
+    const claim = claimRoot(entry);
+    return Boolean(claim) && roots.some((root) => claim === root || claim.startsWith(`${root}/`));
+  });
+}
+
 // basePlanPaths: every plan path on the base branch. A plan whose three-digit id is among them is not new
 // either, so renaming an older plan keeps it an older plan. invariantIds null: the invariants file is not read.
-export function checkNewPlans({ plans, changes, readBase, config = DEFAULT_CONFIG, invariantIds = new Set(), basePlanPaths = [] }) {
+// baseConfig: when given, extraTaskSlices is read from the base branch's settings, and every size gate uses
+// the stricter of baseConfig and config (the smaller cap, forbidBroadOwns on if either has it, both lists of
+// productPaths and screenPaths), so a branch cannot waive its own size gate in the same pull request.
+export function checkNewPlans({ plans, changes, readBase, config = DEFAULT_CONFIG, baseConfig = null, invariantIds = new Set(), basePlanPaths = [] }) {
   const errors = [];
   const added = new Set(changes.filter((c) => c.status === 'A' || c.status === 'R').map((c) => c.path));
+  const extraTaskSlices = (baseConfig ?? config).extraTaskSlices ?? [];
+  const maxTasksPerSlice = baseConfig ? stricterCap(baseConfig.maxTasksPerSlice, config.maxTasksPerSlice) : config.maxTasksPerSlice;
+  const maxOwnsPerSlice = baseConfig ? stricterCap(baseConfig.maxOwnsPerSlice, config.maxOwnsPerSlice) : config.maxOwnsPerSlice;
+  const maxScreensPerSlice = baseConfig ? stricterCap(baseConfig.maxScreensPerSlice, config.maxScreensPerSlice) : config.maxScreensPerSlice;
+  const forbidBroadOwns = config.forbidBroadOwns !== false || (baseConfig !== null && baseConfig.forbidBroadOwns !== false);
+  const both = (key) => [...new Set([...(config[key] ?? []), ...(baseConfig?.[key] ?? [])])];
+  const screenPaths = both('screenPaths');
+  const screenCap = screenPaths.length > 0 && Number.isInteger(maxScreensPerSlice) && maxScreensPerSlice > 0;
+  // A screen root is broad even with the screen cap off: owning all of it is every screen at once.
+  const broadRoots = [...both('productPaths'), ...screenPaths];
   for (const plan of plans) {
     if (!added.has(plan.path) || !plan.header) continue;
     const problems = [];
     if (!('log' in plan.header)) problems.push(`a new plan needs the header field "log: ${logPathFor(plan.file, config)}" (copy ${config.plansDir}/_template.md)`);
-    const taskProblem = tasksProblem(plan.tasks ?? []);
+    const tasks = plan.tasks ?? [];
+    const taskProblem = tasksProblem(tasks);
     if (taskProblem) problems.push(`a new plan needs numbered tasks: ${taskProblem}`);
+    const sliceId = Number.isInteger(plan.header.id) ? plan.header.id : Number(plan.file.match(/^(\d{3})-/)?.[1]);
+    const sliceLabel = Number.isInteger(sliceId) ? `slice ${sliceId}` : 'this slice';
+    const extraAllowed = Number.isInteger(sliceId) && extraTaskSlices.includes(sliceId);
+    if (maxTasksPerSlice != null && tasks.length > maxTasksPerSlice && !extraAllowed) {
+      problems.push(`new plan has ${tasks.length} tasks (max ${maxTasksPerSlice}): split the roadmap row into smaller sequential slices, or ask the user to add ${sliceLabel} to "extraTaskSlices" in ${CONFIG_FILE} on the base branch`);
+    }
+    const ownedPaths = Array.isArray(plan.header.owns) ? plan.header.owns.filter((p) => p !== 'none') : [];
+    if (maxOwnsPerSlice != null && ownedPaths.length > maxOwnsPerSlice && !extraAllowed) {
+      problems.push(`new plan owns ${ownedPaths.length} paths (max ${maxOwnsPerSlice}): split the slice into smaller slices with narrower ownership, or ask the user to add ${sliceLabel} to "extraTaskSlices" in ${CONFIG_FILE} on the base branch`);
+    }
+    if (forbidBroadOwns && broadRoots.length && !extraAllowed) {
+      for (const entry of ownedPaths) {
+        const root = broadClaim(entry, broadRoots);
+        if (root !== null) problems.push(`"owns" lists ${entry}, which claims all of ${root}: own the specific folders or files this slice changes inside it, or ask the user to add ${sliceLabel} to "extraTaskSlices" in ${CONFIG_FILE} on the base branch`);
+      }
+    }
+    const screens = screenCap ? screenClaims(ownedPaths, screenPaths) : [];
+    if (screens.length > maxScreensPerSlice && !extraAllowed) {
+      problems.push(`new plan owns ${screens.length} screen paths (max ${maxScreensPerSlice}: ${screens.join(', ')}): split the slice so each one builds at most ${maxScreensPerSlice} screens, or ask the user to add ${sliceLabel} to "extraTaskSlices" in ${CONFIG_FILE} on the base branch`);
+    }
     for (const k of NEW_PLAN_FIELDS) if (!(k in plan.header)) problems.push(`a new plan needs the header field "${k}:" (${FIELD_HINTS[k]})`);
     const ids = Array.isArray(plan.header.invariants) ? plan.header.invariants.map(String) : [];
     if (ids.length && invariantIds === null) problems.push(`"invariants" names ${ids.join(', ')}, but ${INVARIANTS_FILE} has no line "${INVARIANTS_MARKER}", so its ids are not read. Add that line once the table has the columns Id, Rule, Area, Check, State`);
@@ -1652,6 +1772,7 @@ function main(argv) {
     // see chooseConfig. A folder that is not a git repo has no base and no branch rules, so they count there.
     const proposed = loadConfig(root);
     let config = proposed;
+    let baseConfig = null;
     let kind = null;
     if (listed) {
       const baseRef = resolveBaseRef(repo, proposed, cli.base);
@@ -1665,10 +1786,11 @@ function main(argv) {
         console.error(`Note: ${e.message}. This lead branch is checked with its own settings so it can mend them.`);
         trusted = { ...DEFAULT_CONFIG };
       }
+      baseConfig = trusted;
       ({ config, kind } = chooseConfig({ branch, proposed, trusted }));
     }
     const checked = config;
-    errors = checkRepo(root, { branch, kind, config, files, git: listed ? () => gitFacts(repo, root, staged, checked, cli.base) : null });
+    errors = checkRepo(root, { branch, kind, config, baseConfig, files, git: listed ? () => gitFacts(repo, root, staged, checked, cli.base) : null });
   } catch (e) {
     errors = [`checker could not run: ${e.message}`];
   } finally {
