@@ -464,3 +464,52 @@ test('round 2, finding 4: after a session record moved, either way the message n
     assert.deepEqual(findingsFor(r.dir, { base: 'main' }).unchecked, []);
   } finally { r.cleanup(); }
 });
+
+test('Astra #5: duplicate receipt files for the same review identity (task + at + model) deduplicate to the newest path without double-counting findings', () => {
+  const r = repo();
+  try {
+    // First receipt file committed (lexicographically later name), then a refreshed copy committed later
+    // (lexicographically earlier name) for the exact same review (same task + at + model).
+    const first = r.receipt('T1-ffff1111', '2026-11-19T09:00:00.000Z', counts(2, 1, 0));
+    const movedSession = r.sessionOf('T1-moved');
+    writeFileSync(movedSession, readFileSync(r.sessionOf('T1-ffff1111'), 'utf8'));
+    const refreshed = { ...buildReceipt(readFileSync(movedSession, 'utf8'), movedSession), slice: 1 };
+    r.write('docs/receipts/T1-00002222.json', `${JSON.stringify(refreshed, null, 2)}\n`);
+    r.commit('Refresh receipt with slice and new session path');
+    // A genuine second review round with the same task + model at a later timestamp stays a distinct round.
+    r.receipt('T1-00003333', '2026-11-19T10:00:00.000Z', counts(1, 0, 0));
+
+    assert.equal(first.task, refreshed.task);
+    assert.equal(first.at, refreshed.at);
+    assert.equal(first.model, refreshed.model);
+
+    const found = findingsFor(r.dir, { base: 'main' });
+    assert.deepEqual(found.unchecked, []);
+    assert.deepEqual(found.notes, []);
+    assert.deepEqual(found.rounds, [
+      { round: 1, receipt: 'docs/receipts/T1-00002222.json', counts: counts(2, 1, 0) },
+      { round: 2, receipt: 'docs/receipts/T1-00003333.json', counts: counts(1, 0, 0) },
+    ]);
+    assert.deepEqual(found.owed, [
+      { round: 1, missing: [1, 2, 3] },
+      { round: 2, missing: [1] },
+    ]);
+  } finally { r.cleanup(); }
+});
+
+test('Astra #2 + Opus #5: a receipt with a tampered slice field is flagged by findingsFor while keeping session counts', () => {
+  const r = repo();
+  try {
+    const made = r.receipt('T1-00000001', '2026-11-19T09:00:00.000Z', counts(1));
+    // Matching slice for build/001-x -> clean.
+    r.write(ROUND_1, `${JSON.stringify({ ...made, slice: 1 }, null, 2)}\n`);
+    r.commit('Add matching slice');
+    assert.deepEqual(findingsFor(r.dir, { base: 'main' }).notes, []);
+    // Tampered slice -> flagged as mismatch.
+    r.write(ROUND_1, `${JSON.stringify({ ...made, slice: 999 }, null, 2)}\n`);
+    r.commit('Tamper slice');
+    const tampered = findingsFor(r.dir, { base: 'main' });
+    assert.match(tampered.notes.join('\n'), /does not match its session record/);
+    assert.deepEqual(tampered.owed, [{ round: 1, missing: [1] }]);
+  } finally { r.cleanup(); }
+});

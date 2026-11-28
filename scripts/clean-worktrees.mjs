@@ -53,6 +53,9 @@
 //   --in-use <path>            also keep this folder (repeat for more)
 //   --merged-branch <name>     allow immediate removal (0 idle wait) for a clean worktree on this branch
 //   --merged-commit <sha>      narrow --merged-branch so only a worktree on this commit gets 0 idle wait
+//   --ignore-pid <pid>         for a worktree on a --merged-branch only, do not count this program as
+//                              using it (repeat for more). The merge script passes itself, so a merge
+//                              run from inside the merged worktree does not block its own cleanup
 //   --fetch                    in a dry run, fetch the base branch first (this updates git's remote refs)
 //   --no-fetch                 with --delete, skip the fetch (when the caller just fetched)
 //   --base <remote>/<branch>   branch that "merged" means (default origin/main, or $WORKTREE_BASE)
@@ -78,7 +81,7 @@ export const FILE_LIMIT = 20_000;
 export const REBUILDABLE = new Set(['node_modules', 'dist', 'build', 'out', 'coverage', '.next', '.expo', '.turbo', '.cache', '.vite', '.parcel-cache', '.svelte-kit', 'Pods', 'DerivedData', '.gradle', '__pycache__', '.pytest_cache', 'test-results', 'playwright-report']);
 // Ignored single files that hold nothing of value regardless of contents.
 export const REBUILDABLE_FILES = new Set(['.DS_Store']);
-const USAGE = 'Usage: node scripts/clean-worktrees.mjs [--delete] [--fetch|--no-fetch] [--in-use <path> ...] [--merged-branch <name> ...] [--merged-commit <sha>] [--base origin/main] [--idle-hours 0.25]';
+const USAGE = 'Usage: node scripts/clean-worktrees.mjs [--delete] [--fetch|--no-fetch] [--in-use <path> ...] [--merged-branch <name> ...] [--merged-commit <sha>] [--ignore-pid <pid> ...] [--base origin/main] [--idle-hours 0.25]';
 
 // Parses `git worktree list --porcelain`. The first entry is the main checkout (the project root).
 export function parseWorktreeList(text) {
@@ -122,10 +125,11 @@ export function lsofProblem(stdout, stderr, selfPid) {
   return null;
 }
 
-// The programs with a folder or file open at this folder or inside it, one entry per program.
-export function processesIn(dir, files) {
+// The programs with a folder or file open at this folder or inside it, one entry per program,
+// leaving out the program ids in `ignorePids`.
+export function processesIn(dir, files, ignorePids = new Set()) {
   const seen = new Map();
-  for (const f of files) if ((f.path === dir || f.path.startsWith(dir + sep)) && !seen.has(f.pid)) seen.set(f.pid, { pid: f.pid, command: f.command });
+  for (const f of files) if ((f.path === dir || f.path.startsWith(dir + sep)) && !ignorePids.has(f.pid) && !seen.has(f.pid)) seen.set(f.pid, { pid: f.pid, command: f.command });
   return [...seen.values()];
 }
 
@@ -297,6 +301,7 @@ export function parseArgs(argv, env = {}) {
     inUse: [],
     mergedBranches: [],
     mergedCommit: null,
+    ignorePids: [],
     base: env.WORKTREE_BASE || DEFAULT_BASE,
     idleHours: rawIdle === '' ? DEFAULT_IDLE_HOURS : Number(rawIdle),
     help: false,
@@ -316,6 +321,11 @@ export function parseArgs(argv, env = {}) {
     else if (arg === '--in-use') opts.inUse.push(value());
     else if (arg === '--merged-branch') opts.mergedBranches.push(nonFlagValue());
     else if (arg === '--merged-commit') opts.mergedCommit = nonFlagValue();
+    else if (arg === '--ignore-pid') {
+      const raw = nonFlagValue();
+      if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw usageError('--ignore-pid must be a program id, a whole number above 0');
+      opts.ignorePids.push(Number(raw));
+    }
     else if (arg === '--base') opts.base = value();
     else if (arg === '--idle-hours') {
       const raw = value().trim();
@@ -422,7 +432,7 @@ function gatherFacts(entry, ctx) {
     facts.error = why(e);
   }
   facts.openPr = liveBranch !== null && ctx.openPrs.has(liveBranch);
-  facts.processes = processesIn(dir, ctx.files);
+  facts.processes = processesIn(dir, ctx.files, ctx.ignorePids);
   facts.t3Thread = ctx.t3.owners?.get(dir) ?? null;
   facts.t3Unknown = Boolean(ctx.t3.error) && (dir === ctx.t3Dir || dir.startsWith(ctx.t3Dir + sep));
   return facts;
@@ -501,7 +511,7 @@ export function run(argv, io = {}) {
     const t3 = t3Owners(real(entries[0].path), env);
     const t3Dir = real(join(env.T3CODE_HOME || join(homedir(), '.t3'), 'worktrees'));
     if (t3.error) out(`Note: T3 Code could not be asked about its threads (${t3.error}). Worktrees in ${t3Dir} are kept.\n`);
-    const ctx = { base: opts.base, self, historyUnreadable, inUse: new Set(opts.inUse.map(real)), mergedBranches: new Set(opts.mergedBranches), mergedCommit: opts.mergedCommit, openPrs, files: scan.files, t3, t3Dir };
+    const ctx = { base: opts.base, self, historyUnreadable, inUse: new Set(opts.inUse.map(real)), mergedBranches: new Set(opts.mergedBranches), mergedCommit: opts.mergedCommit, ignorePids: new Set(opts.ignorePids), openPrs, files: scan.files, t3, t3Dir };
 
     let removed = 0;
     let failed = 0;
@@ -509,17 +519,20 @@ export function run(argv, io = {}) {
       if (!existsSync(entry.path)) return;
       const branchMatches = entry.branch !== null && ctx.mergedBranches.has(entry.branch);
       const commitMatches = !ctx.mergedCommit || entry.head === ctx.mergedCommit;
-      const entryQuietMs = branchMatches && commitMatches ? 0 : quietMs;
-      const verdict = judge(entry, i === 0, ctx, entryQuietMs);
+      const justMerged = branchMatches && commitMatches;
+      const entryQuietMs = justMerged ? 0 : quietMs;
+      // --ignore-pid counts only for the just-merged worktree; every other folder sees every program.
+      const ignorePids = justMerged ? ctx.ignorePids : new Set();
+      const verdict = judge(entry, i === 0, { ...ctx, ignorePids }, entryQuietMs);
       const label = { keep: 'kept', leave: 'left alone', remove: 'remove' }[verdict.action];
       out(`${entry.path} [${entry.branch ?? 'detached'}]\n  ${label}: ${verdict.reasons.join('; ')}\n`);
       if (verdict.action !== 'remove' || !opts.remove) return;
       // Check once more just before removing: every git check first, then a fresh list of programs last.
-      const second = judge(entry, false, { ...ctx, files: [] }, entryQuietMs);
+      const second = judge(entry, false, { ...ctx, ignorePids, files: [] }, entryQuietMs);
       if (second.action !== 'remove') { out(`  not removed: it was checked again just before removal: ${second.reasons.join('; ')}\n`); return; }
       const again = scanPrograms(self);
       if (again.error) { out(`  not removed: lsof could not check it again (${again.error})\n`); failed++; return; }
-      const users = processesIn(real(entry.path), again.files);
+      const users = processesIn(real(entry.path), again.files, ignorePids);
       if (users.length) { out(`  not removed: it was checked again just before removal: ${decide({ processes: users, merged: true, lastChangeMs: 0 }).reasons.join('; ')}\n`); return; }
       // No --force: git itself refuses if a file appeared since the check.
       // For a stale-ref worktree (its branch moved in another checkout, while this folder's files

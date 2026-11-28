@@ -8,13 +8,18 @@ import {
   blockStats,
   buildReport,
   classifyRole,
+  defaultAntigravityDirs,
+  findAntigravityFiles,
+  gitWorktreePaths,
   groupRun,
   loadSessions,
   mergedPrs,
   paperworkPathsFor,
   parkedCount,
+  parseAntigravityFile,
   parseClaudeFile,
   parseCodexFile,
+  pathMatchesProject,
   renderHtml,
   renderRun,
   renderText,
@@ -170,7 +175,7 @@ test('cache: unchanged file reused, changed file read again, corrupt cache rebui
   writeFileSync(cacheFile, '{not json');
   const fourth = await loadSessions(opts);
   assert.deepEqual([fourth.parsed, fourth.reused], [2, 0]);
-  assert.equal(JSON.parse(readFileSync(cacheFile, 'utf8')).version, 2);
+  assert.equal(JSON.parse(readFileSync(cacheFile, 'utf8')).version, 5);
   t.done();
 });
 
@@ -553,6 +558,742 @@ test('loadSessions scans multiple claudeDirs and keeps slice ids found in prompt
     const res = await loadSessions({ claudeDirs: [t.claudeDir, claudeDir2], codexDir: t.codexDir, project: 'unilex' });
     assert.equal(res.sessions.length, 2);
     assert.deepEqual(res.sessions.map((s) => s.slice).sort(), ['098', '099']);
+  } finally {
+    t.done();
+  }
+});
+
+// ---- Antigravity / Gemini Neon transcripts ----
+
+function agyStep(u, extra = {}) {
+  return {
+    step_index: extra.step_index ?? 1,
+    source: 'MODEL',
+    type: 'PLANNER_RESPONSE',
+    created_at: extra.created_at ?? TS,
+    model: extra.model ?? 'gemini-4-neon-high',
+    input_tokens: u[0],
+    cache_read_tokens: u[1],
+    output_tokens: u[2],
+    ...extra,
+  };
+}
+
+test('Antigravity: defaultAntigravityDirs isolates tests and findAntigravityFiles supports all layouts', () => {
+  assert.deepEqual(defaultAntigravityDirs({}, '/fake/home'), ['/fake/home/.t3/userdata/providers/antigravity']);
+  assert.deepEqual(defaultAntigravityDirs({ LEDGER_ANTIGRAVITY_DIR: '/tmp/agy' }, '/fake/home'), ['/tmp/agy']);
+  assert.deepEqual(defaultAntigravityDirs({ LEDGER_CLAUDE_DIR: '/tmp/c' }, '/fake/home'), []);
+  assert.deepEqual(defaultAntigravityDirs({ LEDGER_CODEX_DIR: '/tmp/x' }, '/fake/home'), []);
+  assert.deepEqual(defaultAntigravityDirs({ LEDGER_CLAUDE_DIR: '/tmp/c', LEDGER_ANTIGRAVITY_DIR: '/tmp/agy' }, '/fake/home'), ['/tmp/agy']);
+
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    const nested = t.write(join(agyDir, 'hash123', 'antigravity-acp', 'brain', 'conv-a', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    t.write(join(agyDir, 'hash123', 'antigravity-acp', 'brain', 'conv-a', '.system_generated', 'logs', 'transcript_full.jsonl'), []);
+    t.write(join(agyDir, 'hash123', 'antigravity-acp', 'brain', 'conv-a', '.system_generated', 'logs', 'chunks', '00000000.jsonl'), []);
+    const shortNested = t.write(join(agyDir, 'conv-b', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    const flat = t.write(join(agyDir, 'conv-c.jsonl'), []);
+    const found = findAntigravityFiles([agyDir, join(t.root, 'does-not-exist')]).sort();
+    assert.deepEqual(found, [nested, shortNested, flat].sort());
+  } finally {
+    t.done();
+  }
+});
+
+test('Antigravity: parses ctx = input + cache_read, total = ctx + output, and detects compaction', async () => {
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    const file = t.write(join(agyDir, 'conv-compaction', '.system_generated', 'logs', 'transcript.jsonl'), [
+      {
+        step_index: 0,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: `<user_information>\nActive Workspaces:\n- /Users/dev/unilex\nCommand Working Directory: /Users/dev/unilex\n</user_information>\n<user_request>\nYou are the UniLex head agent. Work on Slice 091.\n</user_request>`,
+      },
+      agyStep([30_000, 10_000, 500], { step_index: 1 }), // ctx 40k, total 40,500
+      agyStep([14_000, 500_000, 1_000], { step_index: 2 }), // ctx 514k, total 515,000
+      agyStep([8_000, 150_000, 750], { step_index: 3, tool_calls: [{ name: 'run_command', args: { CommandLine: 'sleep 5 && echo ok' } }] }), // ctx 158k (< 514k * 0.6): compaction!
+      agyStep([20_000, 158_000, 250], { step_index: 4 }), // ctx 178k: no compaction
+    ]);
+    const s = await parseAntigravityFile(file, 'unilex');
+    assert.equal(s.tool, 'antigravity');
+    assert.equal(s.id, 'conv-compaction');
+    assert.equal(s.model, 'gemini-4-neon-high');
+    assert.equal(s.turns, 4);
+    assert.equal(s.startup, 40_000);
+    assert.equal(s.peak, 514_000);
+    assert.equal(s.lastSize, 178_000);
+    assert.equal(s.total, 40_500 + 515_000 + 158_750 + 178_250);
+    assert.equal(s.summaries, 1);
+    assert.equal(s.role, 'head');
+    assert.equal(s.slice, '091');
+    assert.equal(s.cwd, '/Users/dev/unilex');
+    assert.equal(s.sleeps, 1);
+    assert.equal(s.turnLog.length, 4);
+  } finally {
+    t.done();
+  }
+});
+
+test('Antigravity: strips <t3_code_instructions> before classifyRole and sliceId, and classifies Blind Neon reviewers', async () => {
+  assert.equal(classifyRole('You are the Starter Kit head agent.'), 'head');
+  assert.equal(classifyRole('Run a Blind Neon pass on Slice 099.'), 'reviewer');
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    const headFile = t.write(join(agyDir, 'head-session.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: `<t3_code_instructions>\nNever act as a reviewer for Slice 001. Do not invoke builder tools.\n</t3_code_instructions>\n<user_request>\n[T3 Code: the agent in T3 thread "abc" sent this message, not the user.]\n\nYou are the UniLex head agent working on Slice 099.\n</user_request>`,
+      },
+      agyStep([12_000, 8_000, 300]),
+    ]);
+    const head = await parseAntigravityFile(headFile, 'unilex');
+    assert.equal(head.role, 'head');
+    assert.equal(head.slice, '099');
+
+    const reviewFile = t.write(join(agyDir, 'blind-neon.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: `<t3_code_instructions>\nGeneric T3 instructions.\n</t3_code_instructions>\n<user_request>\nAct as the Blind Neon audit for UniLex Slice 088.\n</user_request>`,
+      },
+      agyStep([5_000, 15_000, 200]),
+    ]);
+    const rev = await parseAntigravityFile(reviewFile, 'unilex');
+    assert.equal(rev.role, 'reviewer');
+    assert.equal(rev.slice, '088');
+  } finally {
+    t.done();
+  }
+});
+
+test('Antigravity: sessions from other projects are filtered out cleanly', async () => {
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    t.write(join(agyDir, 'other-cwd.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: `<user_information>\nCommand Working Directory: /Users/dev/aimline\n</user_information>\n<user_request>\nCompare aimline with unilex.\n</user_request>`,
+      },
+      agyStep([10_000, 5_000, 100]),
+    ]);
+    t.write(join(agyDir, 'other-prompt.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: 'Build dashboard widgets for aimline.',
+      },
+      agyStep([10_000, 5_000, 100]),
+    ]);
+    t.write(join(agyDir, 'match-prompt.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: 'You are the UniLex head agent.',
+      },
+      agyStep([10_000, 5_000, 100]),
+    ]);
+    const { sessions } = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'unilex' });
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].id, 'match-prompt');
+  } finally {
+    t.done();
+  }
+});
+
+test('Antigravity: totals appear in daily, role, slice, warning, text, HTML, and CLI LEDGER_ANTIGRAVITY_DIR outputs', async () => {
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    const now = new Date();
+    const todayTs = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 10, 0, 0).toISOString();
+    const steps = [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: todayTs,
+        content: `<user_information>\nActive Workspaces:\n- /Users/dev/unilex\n</user_information>\n<user_request>\nYou are the UniLex head agent on Slice 095.\n</user_request>`,
+      },
+    ];
+    // 151 turns, hitting > 150 turns, peak > 200k, and 1 compaction
+    for (let i = 1; i <= 149; i++) {
+      steps.push(agyStep([1_000, 9_000, 100], { step_index: i, created_at: todayTs }));
+    }
+    steps.push(agyStep([14_000, 500_000, 1_000], { step_index: 150, created_at: todayTs }));
+    steps.push(agyStep([8_000, 150_000, 500], { step_index: 151, created_at: todayTs }));
+    t.write(join(agyDir, 'conv-heavy', '.system_generated', 'logs', 'transcript.jsonl'), steps);
+
+    const out = execFileSync(process.execPath, ['scripts/token-ledger.mjs', '--days', '2', '--project', 'unilex', '--json', '--no-cache'], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        LEDGER_CLAUDE_DIR: t.claudeDir,
+        LEDGER_CODEX_DIR: t.codexDir,
+        LEDGER_ANTIGRAVITY_DIR: agyDir,
+      },
+    });
+    const r = JSON.parse(out);
+    const todayRow = r.perDay[r.perDay.length - 1];
+    const expectedTotal = 149 * 10_100 + 515_000 + 158_500;
+    assert.equal(todayRow.antigravity, expectedTotal);
+    assert.equal(todayRow.claude, 0);
+    assert.equal(todayRow.codex, 0);
+    assert.equal(r.tokens, expectedTotal);
+    assert.equal(r.roles.find((x) => x.role === 'head').total, expectedTotal);
+    assert.equal(r.slices.find((x) => x.slice === '095').total, expectedTotal);
+    assert.equal(r.warnings.longThreads.count, 1);
+    assert.equal(r.warnings.longThreads.worst[0].id, 'conv-heavy');
+    assert.equal(r.warnings.bigContext.count, 1);
+    assert.equal(r.warnings.bigContext.worst[0].id, 'conv-heavy');
+    assert.equal(r.summarized.count, 1);
+    assert.equal(r.summarized.worst[0].id, 'conv-heavy');
+
+    const text = renderText(r);
+    assert.match(text, /Claude Code \+ Codex \+ Antigravity/);
+    assert.match(text, /AGY M/);
+    const html = renderHtml(r);
+    assert.match(html, /Claude Code \+ Codex \+ Antigravity/);
+    assert.match(html, /<th>AGY M<\/th>/);
+    assert.match(html, /Antigravity/);
+    assert.ok(!html.includes(String.fromCharCode(0x2014)));
+  } finally {
+    t.done();
+  }
+});
+
+test('Antigravity: findAntigravityFiles skips worktrees, node_modules, .git, chunks, media and reads brain layout', () => {
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    const nested = t.write(join(agyDir, 'hash123', 'antigravity-acp', 'brain', 'conv-ok', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    const directBrain = t.write(join(agyDir, 'brain', 'conv-brain', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    t.write(join(agyDir, 'hash123', 'antigravity-acp', 'worktrees', 'wt-1', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    t.write(join(agyDir, 'hash123', 'antigravity-acp', 'worktrees', 'wt-2', 'transcript.jsonl'), []);
+    t.write(join(agyDir, 'worktrees', 'wt-3', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    t.write(join(agyDir, 'node_modules', 'pkg', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    t.write(join(agyDir, '.git', 'conv-git', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    t.write(join(agyDir, 'media', 'conv-media', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    t.write(join(agyDir, 'chunks', 'conv-chunks', '.system_generated', 'logs', 'transcript.jsonl'), []);
+    t.write(join(agyDir, 'transcript_full.jsonl'), []);
+    const found = findAntigravityFiles([agyDir]).sort();
+    assert.deepEqual(found, [directBrain, nested].sort());
+  } finally {
+    t.done();
+  }
+});
+
+test('Antigravity: SYSTEM_MESSAGE-only child sessions (including truncated ones) are parsed and classified', async () => {
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    const childFile = t.write(join(agyDir, 'conv-sys', '.system_generated', 'logs', 'transcript.jsonl'), [
+      {
+        step_index: 0,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        created_at: TS,
+        content: 'The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-22T11:43:01Z sender=parent-1 priority=MESSAGE_PRIORITY_HIGH content=You are a secondary Blind Neon reviewer for UniLex Slice 093.\n</SYSTEM_MESSAGE>',
+      },
+      agyStep([8_000, 12_000, 500]),
+    ]);
+    const s = await parseAntigravityFile(childFile, 'unilex');
+    assert.equal(s.skip, undefined);
+    assert.equal(s.role, 'reviewer');
+    assert.equal(s.slice, '093');
+    assert.equal(s.total, 20_500);
+
+    const truncFile = t.write(join(agyDir, 'conv-sys-trunc', '.system_generated', 'logs', 'transcript.jsonl'), [
+      {
+        step_index: 0,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        created_at: TS,
+        content: 'The following is a <SYSTEM_MESSAGE>...',
+        truncated_fields: ['content'],
+      },
+      agyStep([4_000, 6_000, 200]),
+    ]);
+    t.write(join(agyDir, 'conv-sys-trunc', '.system_generated', 'logs', 'transcript_full.jsonl'), [
+      {
+        step_index: 0,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        created_at: TS,
+        content: 'You are a secondary Blind Neon reviewer for UniLex Slice 094.',
+      },
+    ]);
+    const st = await parseAntigravityFile(truncFile, 'unilex');
+    assert.equal(st.skip, undefined);
+    assert.equal(st.role, 'reviewer');
+    assert.equal(st.slice, '094');
+    assert.equal(st.total, 10_200);
+  } finally {
+    t.done();
+  }
+});
+
+test('Antigravity: parent -> child conversationId linking propagates project and slice once without double-counting', async () => {
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    const cacheFile = join(t.root, 'cache.json');
+    const parentId = '11111111-1111-1111-1111-111111111111';
+    const childId = '22222222-2222-2222-2222-222222222222';
+    const grandChildId = '33333333-3333-3333-3333-333333333333';
+    const otherParentId = '44444444-4444-4444-4444-444444444444';
+    const otherChildId = '55555555-5555-5555-5555-555555555555';
+    const cycA = '66666666-6666-6666-6666-666666666666';
+    const cycB = '77777777-7777-7777-7777-777777777777';
+
+    // Parent in unilex, Slice 095, mentions childId twice in subagent responses
+    t.write(join(agyDir, parentId, '.system_generated', 'logs', 'transcript.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: '<user_information>\nActive Workspaces:\n- /Users/dev/unilex\n</user_information>\n<user_request>\nYou are the UniLex head agent on Slice 095.\n</user_request>',
+      },
+      agyStep([10_000, 5_000, 100], { step_index: 1 }),
+      {
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        created_at: TS,
+        content: `Created the following subagent:\n{\n  "conversationId":  "${childId}"\n}`,
+      },
+      {
+        step_index: 3,
+        source: 'MODEL',
+        type: 'GENERIC',
+        created_at: TS,
+        content: `You have 1 active subagent(s):\n[{"conversationId":"${childId}"}]`,
+      },
+    ]);
+
+    // Child has NO cwd, NO project name, NO slice in its prompt, and spawns grandChildId
+    t.write(join(agyDir, childId, '.system_generated', 'logs', 'transcript.jsonl'), [
+      {
+        step_index: 0,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        created_at: TS,
+        content: 'Review the staged diff and report bugs.',
+      },
+      agyStep([20_000, 30_000, 500], { step_index: 1 }),
+      {
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        created_at: TS,
+        content: `Created the following subagent:\n{"conversationId": "${grandChildId}"}`,
+      },
+    ]);
+
+    // Grandchild also has NO cwd, NO project name, NO slice
+    t.write(join(agyDir, grandChildId, '.system_generated', 'logs', 'transcript.jsonl'), [
+      {
+        step_index: 0,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        created_at: TS,
+        content: 'Check edge cases as a reviewer.',
+      },
+      agyStep([5_000, 5_000, 200], { step_index: 1 }),
+    ]);
+
+    // Other project parent + child must NOT leak into unilex
+    t.write(join(agyDir, otherParentId, '.system_generated', 'logs', 'transcript.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: '<user_information>\nActive Workspaces:\n- /Users/dev/aimline\n</user_information>\n<user_request>\nBuild feature.\n</user_request>',
+      },
+      agyStep([10_000, 0, 100], { step_index: 1 }),
+      {
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        created_at: TS,
+        content: `{"conversationId": "${otherChildId}"}`,
+      },
+    ]);
+    t.write(join(agyDir, otherChildId, '.system_generated', 'logs', 'transcript.jsonl'), [
+      {
+        step_index: 0,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        created_at: TS,
+        content: 'Inspect the diff.',
+      },
+      agyStep([9_000, 0, 100], { step_index: 1 }),
+    ]);
+
+    // Cycle between two unlinked sessions must terminate cleanly without hanging
+    t.write(join(agyDir, cycA, '.system_generated', 'logs', 'transcript.jsonl'), [
+      { step_index: 0, type: 'SYSTEM_MESSAGE', created_at: TS, content: 'Loop A.' },
+      agyStep([1_000, 0, 10]),
+      { step_index: 2, type: 'GENERIC', created_at: TS, content: `{"conversationId": "${cycB}"}` },
+    ]);
+    t.write(join(agyDir, cycB, '.system_generated', 'logs', 'transcript.jsonl'), [
+      { step_index: 0, type: 'SYSTEM_MESSAGE', created_at: TS, content: 'Loop B.' },
+      agyStep([1_000, 0, 10]),
+      { step_index: 2, type: 'GENERIC', created_at: TS, content: `{"conversationId": "${cycA}"}` },
+    ]);
+
+    const first = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'unilex', cacheFile });
+    assert.deepEqual(first.sessions.map((s) => s.id).sort(), [parentId, childId, grandChildId].sort());
+    assert.equal(first.sessions.reduce((a, s) => a + s.total, 0), 15_100 + 50_500 + 10_200);
+    for (const s of first.sessions) {
+      assert.equal(s.cwd, '/Users/dev/unilex');
+      assert.equal(s.slice, '095');
+    }
+
+    // Re-running with cache produces identical results without double-counting
+    const second = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'unilex', cacheFile });
+    assert.equal(second.parsed, 0);
+    assert.deepEqual(second.sessions.map((s) => s.id).sort(), [parentId, childId, grandChildId].sort());
+    assert.equal(second.sessions.reduce((a, s) => a + s.total, 0), 15_100 + 50_500 + 10_200);
+  } finally {
+    t.done();
+  }
+});
+
+test('project matching: aimline does not match aimline-archive, and starter-kit cwd/tool paths reject unilex prose mentions', async () => {
+  assert.equal(pathMatchesProject('/Users/dev/aimline/src', 'aimline'), true);
+  assert.equal(pathMatchesProject('/Users/stephen/.t3/worktrees/aimline/t3-abc', 'aimline'), true);
+  assert.equal(pathMatchesProject('/Users/dev/aimline-archive/src', 'aimline'), false);
+  assert.equal(pathMatchesProject('/Users/dev/my-aimline/src', 'aimline'), false);
+
+  const t = tree();
+  try {
+    // Claude, Codex, and Antigravity sessions in aimline vs aimline-archive
+    t.write(join(t.claudeDir, '-Users-dev-aimline', 'a1.jsonl'), [
+      user('Build Aimline.', { cwd: '/Users/dev/aimline' }),
+      reply('m1', [100, 0, 0, 50]),
+    ]);
+    t.write(join(t.claudeDir, '-Users-dev-aimline-archive', 'a2.jsonl'), [
+      user('Old archive work.', { cwd: '/Users/dev/aimline-archive' }),
+      reply('m2', [200, 0, 0, 50]),
+    ]);
+    codexSession(t, '/Users/dev/aimline', 'rollout-2026-11-12T10-00-00-01a1b2c3-0000-7000-8000-000000000011.jsonl');
+    codexSession(t, '/Users/dev/aimline-archive', 'rollout-2026-11-12T10-00-00-01a1b2c3-0000-7000-8000-000000000012.jsonl');
+
+    const agyDir = join(t.root, 'agy');
+    t.write(join(agyDir, 'aimline-real.jsonl'), [
+      { step_index: 0, type: 'USER_INPUT', created_at: TS, content: '<user_information>\nActive Workspaces:\n- /Users/dev/aimline\n</user_information>\n<user_request>Work.</user_request>' },
+      agyStep([1_000, 0, 10]),
+    ]);
+    t.write(join(agyDir, 'aimline-archive.jsonl'), [
+      { step_index: 0, type: 'USER_INPUT', created_at: TS, content: '<user_information>\nActive Workspaces:\n- /Users/dev/aimline-archive\n</user_information>\n<user_request>Archive work.</user_request>' },
+      agyStep([2_000, 0, 10]),
+    ]);
+    // Starter-kit session inferred from tool_calls whose prompt mentions ~/dev/unilex
+    t.write(join(agyDir, 'starter-kit-mentions-unilex.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: 'Review starter-kit token-ledger changes that will later sync into ~/dev/unilex.',
+      },
+      agyStep([5_000, 10_000, 200], {
+        step_index: 1,
+        tool_calls: [
+          { name: 'read_file', args: { Path: '"/Users/stephengarner/dev/starter-kit/scripts/token-ledger.mjs"' } },
+          { name: 'run_command', args: { CommandLine: '"cd /Users/stephengarner/dev/starter-kit && node --test"' } },
+        ],
+      }),
+    ]);
+
+    const aimline = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'aimline' });
+    assert.equal(aimline.sessions.length, 3);
+    assert.ok(aimline.sessions.every((s) => pathMatchesProject(s.cwd, 'aimline')));
+
+    const unilex = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'unilex' });
+    assert.equal(unilex.sessions.length, 0);
+
+    const starterKit = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'starter-kit' });
+    assert.equal(starterKit.sessions.length, 1);
+    assert.equal(starterKit.sessions[0].id, 'starter-kit-mentions-unilex');
+  } finally {
+    t.done();
+  }
+});
+
+test('classifyRole: head-agent regex allows apostrophes and rejects negation and comma clauses', () => {
+  assert.equal(classifyRole('You are the head agent.'), 'head');
+  assert.equal(classifyRole('You are the UniLex head agent.'), 'head');
+  assert.equal(classifyRole('You are the Starter Kit head agent.'), 'head');
+  assert.equal(classifyRole("You are the Mary's Land head agent. Follow AGENTS.md."), 'head');
+  assert.equal(classifyRole('You are the Mary\u2019s Land head agent. Follow AGENTS.md.'), 'head');
+  assert.equal(classifyRole('You are the builder, not the head agent'), 'builder');
+  assert.equal(classifyRole('You are the builder, not the head agent.'), 'builder');
+  assert.equal(classifyRole('You are the **builder**, not the head agent.'), 'builder');
+  assert.equal(classifyRole('You are the reviewer, not the head agent.'), 'reviewer');
+  assert.equal(classifyRole('You are the not head agent.'), 'other');
+});
+
+test('Antigravity: tool-call cwd inference preserves nested project folders and handles stray paths', async () => {
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    t.write(join(agyDir, 'nested-multi.jsonl'), [
+      { step_index: 0, type: 'USER_INPUT', created_at: TS, content: 'Fix the flight telemetry parser.' },
+      agyStep([3_000, 7_000, 100], {
+        step_index: 1,
+        tool_calls: [
+          { name: 'read_file', args: { Path: '/Users/dev/hired_work/ElectraFly/src/app.ts' } },
+          { name: 'read_file', args: { Path: '/Users/dev/hired_work/ElectraFly/package.json' } },
+        ],
+      }),
+    ]);
+    t.write(join(agyDir, 'nested-single.jsonl'), [
+      { step_index: 0, type: 'USER_INPUT', created_at: TS, content: 'Inspect one file.' },
+      agyStep([2_000, 3_000, 50], {
+        step_index: 1,
+        tool_calls: [
+          { name: 'read_file', args: { Path: '/Users/stephen/dev/hired_work/ElectraFly/src/app.ts' } },
+        ],
+      }),
+    ]);
+    t.write(join(agyDir, 'nested-with-stray.jsonl'), [
+      { step_index: 0, type: 'USER_INPUT', created_at: TS, content: 'Compare with another repo.' },
+      agyStep([2_000, 4_000, 50], {
+        step_index: 1,
+        tool_calls: [
+          { name: 'read_file', args: { Path: '/Users/stephen/dev/hired_work/ElectraFly/src/a.ts' } },
+          { name: 'read_file', args: { Path: '/Users/stephen/dev/hired_work/ElectraFly/tests/b.ts' } },
+          { name: 'read_file', args: { Path: '/Users/stephen/dev/other-repo/README.md' } },
+        ],
+      }),
+    ]);
+
+    const matched = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'ElectraFly' });
+    assert.deepEqual(matched.sessions.map((s) => s.id).sort(), ['nested-multi', 'nested-single', 'nested-with-stray']);
+    assert.equal(matched.sessions.find((s) => s.id === 'nested-multi').cwd, '/Users/dev/hired_work/ElectraFly');
+    assert.equal(matched.sessions.find((s) => s.id === 'nested-single').cwd, '/Users/stephen/dev/hired_work/ElectraFly/src');
+    assert.equal(matched.sessions.find((s) => s.id === 'nested-with-stray').cwd, '/Users/stephen/dev/hired_work/ElectraFly');
+
+    const wrong = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'hired_work_other' });
+    assert.equal(wrong.sessions.length, 0);
+
+    const stray = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'other-repo' });
+    assert.equal(stray.sessions.length, 0);
+  } finally {
+    t.done();
+  }
+});
+
+test('Antigravity: tool-call cwd inference clusters below .t3/worktrees when reads span two projects', async () => {
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    t.write(join(agyDir, 'wt-cross-project.jsonl'), [
+      { step_index: 0, type: 'USER_INPUT', created_at: TS, content: 'Inspect the mobile file and compare with another worktree.' },
+      agyStep([4_000, 8_000, 150], {
+        step_index: 1,
+        tool_calls: [
+          { name: 'read_file', args: { Path: '/Users/stephen/.t3/worktrees/unilex/t3-abc/apps/mobile/a.ts' } },
+          { name: 'read_file', args: { Path: '/Users/stephen/.t3/worktrees/unilex/t3-abc/apps/mobile/a.ts' } },
+          { name: 'read_file', args: { Path: '/Users/stephen/.t3/worktrees/aimline/t3-xyz/src/b.ts' } },
+        ],
+      }),
+    ]);
+
+    const unilex = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'unilex' });
+    assert.equal(unilex.sessions.length, 1);
+    assert.equal(unilex.sessions[0].id, 'wt-cross-project');
+    assert.equal(unilex.sessions[0].cwd, '/Users/stephen/.t3/worktrees/unilex/t3-abc');
+
+    const aimline = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'aimline' });
+    assert.equal(aimline.sessions.length, 0);
+  } finally {
+    t.done();
+  }
+});
+
+test('registered git worktrees match Claude, Codex, and Antigravity sessions while unrelated folders stay excluded', async () => {
+  const wt = '/private/tmp/unilex-kit-530';
+  assert.equal(pathMatchesProject(wt, 'unilex'), false);
+  assert.equal(pathMatchesProject(wt, 'unilex', [wt]), true);
+  assert.equal(pathMatchesProject(`${wt}/apps/mobile`, 'unilex', new Set([`${wt}/`])), true);
+  assert.equal(pathMatchesProject(`${wt}-other`, 'unilex', [wt]), false);
+  assert.equal(pathMatchesProject('/Users/dev/aimline-archive', 'unilex', [wt]), false);
+  assert.equal(pathMatchesProject('/Users/dev/aimline-archive', 'aimline', [wt]), false);
+
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    const cacheFile = join(t.root, 'cache.json');
+
+    // Claude session in registered worktree and one in unrelated archive
+    t.write(join(t.claudeDir, '-private-tmp-unilex-kit-530', 'c-wt.jsonl'), [
+      user('You are a **builder** for UniLex.', { cwd: wt }),
+      reply('m1', [100, 0, 0, 50]),
+    ]);
+    t.write(join(t.claudeDir, '-Users-dev-aimline-archive', 'c-other.jsonl'), [
+      user('Archive work.', { cwd: '/Users/dev/aimline-archive' }),
+      reply('m2', [100, 0, 0, 50]),
+    ]);
+
+    // Codex sessions in registered worktree vs unrelated archive
+    codexSession(t, wt, 'rollout-2026-11-12T10-00-00-01a1b2c3-0000-7000-8000-000000000021.jsonl');
+    codexSession(t, '/Users/dev/aimline-archive', 'rollout-2026-11-12T10-00-00-01a1b2c3-0000-7000-8000-000000000022.jsonl');
+
+    // Antigravity sessions: explicit cwd in worktree, tool-call inferred cwd in worktree, and unrelated archive
+    t.write(join(agyDir, 'agy-wt-cwd.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: `<user_information>\nCommand Working Directory: ${wt}\n</user_information>\n<user_request>Work on task.</user_request>`,
+      },
+      agyStep([2_000, 3_000, 100]),
+    ]);
+    t.write(join(agyDir, 'agy-wt-tools.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: 'Inspect files in the worktree.',
+      },
+      agyStep([1_500, 2_500, 50], {
+        step_index: 1,
+        tool_calls: [{ name: 'read_file', args: { Path: `${wt}/scripts/merge-pr.mjs` } }],
+      }),
+    ]);
+    t.write(join(agyDir, 'agy-archive.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: '<user_information>\nCommand Working Directory: /Users/dev/aimline-archive\n</user_information>\n<user_request>Archive work.</user_request>',
+      },
+      agyStep([4_000, 1_000, 50]),
+    ]);
+
+    // Without worktrees, none of these match project "unilex" (and Codex skip gets cached).
+    const withoutWt = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'unilex', cacheFile });
+    assert.equal(withoutWt.sessions.length, 0);
+
+    // With registered worktree, Claude, Codex, and both Antigravity sessions match; aimline-archive stays excluded.
+    const withWt = await loadSessions({ claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'unilex', worktrees: [wt], cacheFile });
+    assert.equal(withWt.sessions.length, 4);
+    assert.deepEqual(
+      withWt.sessions.map((s) => s.tool).sort(),
+      ['antigravity', 'antigravity', 'claude', 'codex'],
+    );
+    assert.ok(withWt.sessions.every((s) => s.cwd === wt));
+
+    // Also verify real git worktree discovery via gitWorktreePaths (and non-git fallback).
+    const nonGit = mkdtempSync(join(tmpdir(), 'ledger-nogit-'));
+    try {
+      assert.deepEqual(gitWorktreePaths(nonGit), []);
+    } finally {
+      rmSync(nonGit, { recursive: true, force: true });
+    }
+
+    const repoRoot = mkdtempSync(join(tmpdir(), 'ledger-wt-repo-'));
+    const extraWt = join(tmpdir(), `unilex-kit-530-${process.pid}-${Date.now()}`);
+    const gitEnv = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    const git = (...args) => execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8', env: gitEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      git('init', '-q', '-b', 'main');
+      writeFileSync(join(repoRoot, 'README.md'), 'hi\n');
+      git('add', 'README.md');
+      git('commit', '-q', '-m', 'init');
+      git('worktree', 'add', '-q', '-b', 'wt-530', extraWt);
+      const discovered = gitWorktreePaths(repoRoot);
+      assert.equal(pathMatchesProject(extraWt, 'unilex', discovered), true);
+      assert.equal(pathMatchesProject(join(extraWt, 'sub', 'file.js'), 'unilex', discovered), true);
+      assert.equal(pathMatchesProject('/Users/dev/aimline-archive', 'unilex', discovered), false);
+    } finally {
+      rmSync(extraWt, { recursive: true, force: true });
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  } finally {
+    t.done();
+  }
+});
+
+test('cache: Antigravity inferred cwd is invalidated when registered worktrees change and matches no-cache', async () => {
+  const wt = '/private/tmp/unilex-kit-530';
+  const t = tree();
+  try {
+    const agyDir = join(t.root, 'agy');
+    const cacheFile = join(t.root, 'cache.json');
+    t.write(join(agyDir, 'agy-stale-guess.jsonl'), [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: TS,
+        content: 'Inspect the updated files and compare with starter-kit.',
+      },
+      agyStep([2_000, 3_000, 100], {
+        step_index: 1,
+        tool_calls: [
+          { name: 'read_file', args: { Path: `${wt}/apps/mobile/a.ts` } },
+          { name: 'read_file', args: { Path: `${wt}/apps/mobile/b.ts` } },
+          { name: 'read_file', args: { Path: '/Users/dev/starter-kit/scripts/token-ledger.mjs' } },
+        ],
+      }),
+    ]);
+
+    const baseOpts = { claudeDir: t.claudeDir, codexDir: t.codexDir, antigravityDir: agyDir, project: 'unilex' };
+
+    // Run 1: before wt is registered, the cache stores an inferred starter-kit cwd and drops the session for unilex.
+    const run1 = await loadSessions({ ...baseOpts, worktrees: [], cacheFile });
+    assert.equal(run1.sessions.length, 0);
+    const cachedAfterRun1 = JSON.parse(readFileSync(cacheFile, 'utf8'));
+    assert.deepEqual(cachedAfterRun1.worktrees, []);
+    assert.equal(Object.values(cachedAfterRun1.files)[0].summary.cwd, '/Users/dev/starter-kit/scripts');
+
+    // Run 2: after wt is registered, the same cache file must invalidate and match a --no-cache run identically.
+    const run2Cached = await loadSessions({ ...baseOpts, worktrees: [wt], cacheFile });
+    const run2NoCache = await loadSessions({ ...baseOpts, worktrees: [wt], cacheFile: null });
+    assert.equal(run2Cached.sessions.length, 1);
+    assert.equal(run2NoCache.sessions.length, 1);
+    assert.equal(run2Cached.reused, 0);
+    assert.equal(run2Cached.sessions[0].cwd, wt);
+    assert.deepEqual(run2Cached.sessions, run2NoCache.sessions);
+
+    // Run 3: unchanged worktree set reuses the cache and still matches --no-cache.
+    const run3Reused = await loadSessions({ ...baseOpts, worktrees: [`${wt}/`], cacheFile });
+    assert.equal(run3Reused.parsed, 0);
+    assert.equal(run3Reused.reused, 1);
+    assert.deepEqual(run3Reused.sessions, run2NoCache.sessions);
+
+    // Run 4: removing wt invalidates the cache again and matches --no-cache.
+    const run4Removed = await loadSessions({ ...baseOpts, worktrees: [], cacheFile });
+    const run4NoCache = await loadSessions({ ...baseOpts, worktrees: [], cacheFile: null });
+    assert.equal(run4Removed.sessions.length, 0);
+    assert.deepEqual(run4Removed.sessions, run4NoCache.sessions);
+
+    // Run 5: stale version 4 cache carrying the new worktree list with an old wrong cwd guess
+    // is rebuilt once on upgrade to version 5 and matches --no-cache.
+    const staleV4 = JSON.parse(readFileSync(cacheFile, 'utf8'));
+    staleV4.version = 4;
+    staleV4.worktrees = [wt];
+    writeFileSync(cacheFile, JSON.stringify(staleV4));
+    const run5Upgrade = await loadSessions({ ...baseOpts, worktrees: [wt], cacheFile });
+    assert.equal(run5Upgrade.parsed, 1);
+    assert.equal(run5Upgrade.reused, 0);
+    assert.equal(run5Upgrade.sessions.length, 1);
+    assert.deepEqual(run5Upgrade.sessions, run2NoCache.sessions);
+    assert.equal(JSON.parse(readFileSync(cacheFile, 'utf8')).version, 5);
   } finally {
     t.done();
   }

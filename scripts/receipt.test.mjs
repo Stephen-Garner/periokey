@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { OPTIONAL_FIELDS, RECEIPT_DIR, approvals, buildReceipt, checkReceipts, checkWeakenings, countBranchReceipts, formatFingerprints, neededCommits, parseSession, receiptPath } from './receipt.mjs';
+import { DEFAULT_GRACE_REVIEW_ROUND, DEFAULT_MAX_REVIEW_ROUNDS, DEFAULT_MAX_TASK_REVIEW_ROUNDS, OPTIONAL_FIELDS, RECEIPT_DIR, REV6_WARN_ROUND, approvals, baseReceiptSlicesFromGit, branchSlice, buildReceipt, checkReceipts, checkWeakenings, countBranchReceipts, countSliceReceipts, countTaskReceipts, evaluateGraceRound, formatFingerprints, neededCommits, normalizeTaskId, parseSession, receiptMatches, receiptPath, roundKey, subjectSlice } from './receipt.mjs';
 import { findingsFor } from './findings.mjs';
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'receipt.mjs');
@@ -911,8 +911,8 @@ test('command line: make works for a "changes needed" reply, keeps its counts, a
     assert.match(made.stdout, /it is this review round on record\. Only an approving receipt lets a merge through\.$/m);
     const [file] = readdirSync(join(r.work, RECEIPT_DIR));
     const saved = JSON.parse(readFileSync(join(r.work, RECEIPT_DIR, file), 'utf8'));
-    assert.deepEqual([saved.verdict, saved.counts, saved.level], ['changes needed', { important: 2, nit: 1, preExisting: 0 }, 'standard']);
-    assert.deepEqual(Object.keys(saved), [...OLD_KEYS, 'counts', 'level']);
+    assert.deepEqual([saved.verdict, saved.counts, saved.level, saved.slice], ['changes needed', { important: 2, nit: 1, preExisting: 0 }, 'standard', 84]);
+    assert.deepEqual(Object.keys(saved), [...OLD_KEYS, 'counts', 'level', 'slice']);
     git(r.work, 'add', '-A');
     git(r.work, 'commit', '-q', '-m', 'Receipt for round 1');
     const found = findingsFor(r.work, { base: 'origin/main', branch: 'HEAD' });
@@ -1139,82 +1139,82 @@ test('REV-6 circuit breaker: warns at round 7, stops past 10, ignores local over
       writeFileSync(file, text);
       return file;
     };
-    const makeRound = (n, { task = 'build-084-welcome', verdict = 'changes needed' } = {}) => {
+    const makeRound = (n, { task = `build-084-part-${Math.ceil(n / 4)}`, verdict = 'changes needed' } = {}) => {
       const ts = `2026-11-14T10:${String(n).padStart(2, '0')}:00.000Z`;
       const session = writeAt(join(r.dir, `r${n}.jsonl`), { task, verdict, ts });
       return { session, ts, res: cli(r.work, 'make', session) };
     };
-    // Reusing the SAME TASK id across rounds still counts each round separately via timestamp.
-    for (let i = 1; i <= 6; i++) {
+    // Reusing the SAME TASK id across rounds (up to 4 per task) still counts each round separately via timestamp.
+    for (let i = 1; i <= 7; i++) {
       const { res } = makeRound(i);
       assert.equal(res.status, 0, res.stderr);
-      assert.doesNotMatch(res.stdout, /Warning \(REV-6\)/);
+      assert.doesNotMatch(res.stdout, /Warning \(REV-6\): This branch is on review round/);
       git(r.work, 'add', '-A');
       git(r.work, 'commit', '-q', '-m', `Receipt ${i}`);
     }
-    for (let i = 7; i <= 9; i++) {
+    for (let i = 8; i <= 11; i++) {
       const { res } = makeRound(i);
       assert.equal(res.status, 0, res.stderr);
-      assert.match(res.stdout, new RegExp(`Warning \\(REV-6\\): This branch is on review round ${i} of 10`));
+      assert.match(res.stdout, new RegExp(`Warning \\(REV-6\\): This branch is on review round ${i} of 12`));
       git(r.work, 'add', '-A');
       git(r.work, 'commit', '-q', '-m', `Receipt ${i}`);
     }
 
-    const r10 = makeRound(10);
-    assert.equal(r10.res.status, 0, r10.res.stderr);
-    assert.match(r10.res.stdout, /Warning \(REV-6\): This branch is on review round 10 of 10/);
-    // Re-running make on the exact same round-10 session stays idempotent.
-    assert.equal(cli(r.work, 'make', r10.session).status, 0);
+    const r12 = makeRound(12);
+    assert.equal(r12.res.status, 0, r12.res.stderr);
+    assert.match(r12.res.stdout, /Warning \(REV-6\): This branch is on review round 12 of 12/);
+    // Re-running make on the exact same round-12 session stays idempotent.
+    assert.equal(cli(r.work, 'make', r12.session).status, 0);
     git(r.work, 'add', '-A');
-    git(r.work, 'commit', '-q', '-m', 'Receipt 10');
+    git(r.work, 'commit', '-q', '-m', 'Receipt 12');
 
     // No self-service CLI flag exists anymore.
-    const r11 = makeRound(11);
-    assert.equal(r11.res.status, 1);
-    assert.match(r11.res.stderr, /STOP: Review round 11 exceeds maxReviewRounds \(10\)/);
-    assert.equal(cli(r.work, 'make', r11.session, '--allow-extra-round').status, 2, 'CLI escape hatch is removed');
+    const r13 = makeRound(13);
+    assert.equal(r13.res.status, 1);
+    assert.match(r13.res.stderr, /STOP: Review round 13 exceeds maxReviewRounds \(12\)/);
+    assert.equal(cli(r.work, 'make', r13.session, '--allow-extra-round').status, 2, 'CLI escape hatch is removed');
 
     // A build branch editing its own local kit.config.json cannot allow itself extra rounds.
-    writeFileSync(join(r.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxReviewRounds: 10, extraReviewRoundSlices: [84], features: { events: true } }));
-    const localBypass = cli(r.work, 'make', r11.session);
+    writeFileSync(join(r.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxReviewRounds: 12, extraReviewRoundSlices: [84], features: { events: true } }));
+    const localBypass = cli(r.work, 'make', r13.session);
     assert.equal(localBypass.status, 1, 'local extraReviewRoundSlices is ignored');
     assert.match(localBypass.stderr, /An ask for Stephen was filed \(id [0-9a-f]+\)/);
-    const repeatStop = cli(r.work, 'make', r11.session);
+    const repeatStop = cli(r.work, 'make', r13.session);
     assert.equal(repeatStop.status, 1);
     assert.match(repeatStop.stderr, /An ask for Stephen is already filed \(id [0-9a-f]+\)/, 'only one open ask is filed per branch');
 
-    // Only adding the slice on the base branch (Stephen's action) unlocks round 11.
+    // Only adding the slice on the base branch (Stephen's action) unlocks round 13.
     rmSync(join(r.work, 'scripts', 'kit.config.json'));
     git(r.work, 'switch', '-q', 'main');
-    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ maxReviewRounds: 10, extraReviewRoundSlices: [84] }), 'Stephen allows slice 84 extra rounds');
+    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ maxReviewRounds: 12, extraReviewRoundSlices: [84] }), 'Stephen allows slice 84 extra rounds');
     git(r.work, 'push', '-q', 'origin', 'main');
     git(r.work, 'switch', '-q', 'build/084-welcome');
-    const r11Allowed = cli(r.work, 'make', r11.session);
-    assert.equal(r11Allowed.status, 0, r11Allowed.stderr);
+    const r13Allowed = cli(r.work, 'make', r13.session);
+    assert.equal(r13Allowed.status, 0, r13Allowed.stderr);
     git(r.work, 'add', '-A');
-    git(r.work, 'commit', '-q', '-m', 'Receipt 11');
+    git(r.work, 'commit', '-q', '-m', 'Receipt 13');
 
-    // Once Stephen removes the slice from extraReviewRoundSlices, refreshing the moved round-11 session
-    // still succeeds (same task + at + model), while a new round 12 is blocked.
+    // Once Stephen removes the slice from extraReviewRoundSlices, refreshing the moved round-13 session
+    // still succeeds (same task + at + model), while a new round 14 is blocked.
     git(r.work, 'switch', '-q', 'main');
-    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ maxReviewRounds: 10, extraReviewRoundSlices: [] }), 'Remove slice 84 override');
+    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ maxReviewRounds: 12, extraReviewRoundSlices: [] }), 'Remove slice 84 override');
     git(r.work, 'push', '-q', 'origin', 'main');
     git(r.work, 'switch', '-q', 'build/084-welcome');
-    const r11Moved = join(r.dir, 'archived-r11.jsonl');
-    writeFileSync(r11Moved, readFileSync(r11.session, 'utf8'));
-    const r11Refreshed = cli(r.work, 'make', r11Moved);
-    assert.equal(r11Refreshed.status, 0, r11Refreshed.stderr);
-    const r12Blocked = makeRound(12);
-    assert.equal(r12Blocked.res.status, 1);
-    assert.match(r12Blocked.res.stderr, /STOP: Review round 12 exceeds maxReviewRounds \(10\)/);
+    const r13Moved = join(r.dir, 'archived-r13.jsonl');
+    writeFileSync(r13Moved, readFileSync(r13.session, 'utf8'));
+    const r13Refreshed = cli(r.work, 'make', r13Moved);
+    assert.equal(r13Refreshed.status, 0, r13Refreshed.stderr);
+    const r14Blocked = makeRound(14);
+    assert.equal(r14Blocked.res.status, 1);
+    assert.match(r14Blocked.res.stderr, /STOP: Review round 14 exceeds maxReviewRounds \(12\)/);
 
     // maxReviewRounds: 0 on base disables the cap.
     git(r.work, 'switch', '-q', 'main');
     commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ maxReviewRounds: 0 }), 'Disable cap');
     git(r.work, 'push', '-q', 'origin', 'main');
     git(r.work, 'switch', '-q', 'build/084-welcome');
-    const r12Unlimited = makeRound(12, { verdict: 'approve' });
-    assert.equal(r12Unlimited.res.status, 0, r12Unlimited.res.stderr);
+    const r14Unlimited = makeRound(14, { verdict: 'approve' });
+    assert.equal(r14Unlimited.res.status, 0, r14Unlimited.res.stderr);
   } finally { r.cleanup(); }
 });
 
@@ -1233,24 +1233,31 @@ test('REV-6 circuit breaker: moved session receipts count once, reused task ids 
       return session;
     };
     for (let i = 1; i <= 6; i++) {
-      const s = writeSession(`orig-r${i}`, 'build-084-welcome', `2026-11-14T11:${String(i).padStart(2, '0')}:00.000Z`);
+      const task = i <= 4 ? 'build-084-part-1' : 'build-084-part-2';
+      const s = writeSession(`orig-r${i}`, task, `2026-11-14T11:${String(i).padStart(2, '0')}:00.000Z`);
       assert.equal(cli(r.work, 'make', s).status, 0);
       git(r.work, 'add', '-A');
       git(r.work, 'commit', '-q', '-m', `Receipt ${i}`);
     }
     // Simulate rotated session files for rounds 2 to 6 (same task + at + model -> still 6 rounds across 11 files).
     for (let i = 2; i <= 6; i++) {
-      const moved = writeSession(`archived-r${i}`, 'build-084-welcome', `2026-11-14T11:${String(i).padStart(2, '0')}:00.000Z`);
+      const task = i <= 4 ? 'build-084-part-1' : 'build-084-part-2';
+      const moved = writeSession(`archived-r${i}`, task, `2026-11-14T11:${String(i).padStart(2, '0')}:00.000Z`);
       const res = cli(r.work, 'make', moved);
       assert.equal(res.status, 0, res.stderr);
       git(r.work, 'add', '-A');
       git(r.work, 'commit', '-q', '-m', `Refresh receipt ${i}`);
     }
     assert.equal(readdirSync(join(r.work, RECEIPT_DIR)).length, 11, 'eleven receipt files exist on disk for six distinct rounds');
-    // Round 7 with the same reused task id reports round 7 of 10, not round 12 or round 1.
-    const r7 = cli(r.work, 'make', writeSession('orig-r7', 'build-084-welcome', '2026-11-14T11:07:00.000Z'));
+    // Round 7 with the same reused task id reports no slice warning yet (warn starts at 8 of 12); round 8 warns.
+    const r7 = cli(r.work, 'make', writeSession('orig-r7', 'build-084-part-2', '2026-11-14T11:07:00.000Z'));
     assert.equal(r7.status, 0, r7.stderr);
-    assert.match(r7.stdout, /Warning \(REV-6\): This branch is on review round 7 of 10/);
+    assert.match(r7.stdout, /Warning \(REV-6\): Task build-084-part-2 is on review round 3\/4 \(slice total 7\/12, branch 7, task 3\/4\)/);
+    git(r.work, 'add', '-A');
+    git(r.work, 'commit', '-q', '-m', 'Receipt 7');
+    const r8 = cli(r.work, 'make', writeSession('orig-r8-warn', 'build-084-part-2', '2026-11-14T11:07:30.000Z'));
+    assert.equal(r8.status, 0, r8.stderr);
+    assert.match(r8.stdout, /Warning \(REV-6\): This branch is on review round 8 of 12/);
 
     // Invalid maxReviewRounds fails loud instead of silently disabling the cap.
     writeFileSync(join(r.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxReviewRounds: -1 }));
@@ -1283,5 +1290,623 @@ test('REV-6 circuit breaker: moved session receipts count once, reused task ids 
     assert.equal(corrupt.status, 1);
     assert.match(corrupt.stderr, /Cannot count review rounds: receipt docs\/receipts\/broken-00000000\.json is not valid JSON/);
     assert.equal(readdirSync(join(r.work, RECEIPT_DIR)).length, beforeFiles);
+  } finally { r.cleanup(); }
+});
+
+// ---------- Kit 5.3.0: Task + slice-wide review brake ----------
+
+test('REV-6 per-task brake: warns on stdout at round 3 (changes needed only), stops at round 5 (past default 4), and auto-files an ask', () => {
+  assert.equal(DEFAULT_MAX_TASK_REVIEW_ROUNDS, 4);
+  assert.equal(REV6_WARN_ROUND, 3);
+  const r = repo();
+  try {
+    git(r.work, 'switch', '-q', 'main');
+    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ features: { events: true } }), 'Turn events on');
+    git(r.work, 'push', '-q', 'origin', 'main');
+    git(r.work, 'switch', '-q', 'build/084-welcome');
+    const sha = commitFile(r.work, 'src/app.js', 'export const one = 11;\n', 'Change app');
+    const fp = need(r, 'origin/main').list[0].fingerprint;
+    const makeSession = (name, { task = '084-t1', verdict = 'changes needed', ts }) => {
+      const session = join(r.dir, `${name}.jsonl`);
+      writeFileSync(session, claudeRecord({
+        fps: [{ fingerprint: fp, commit: sha }],
+        model: 'gpt-6.1-sol',
+        text: reply({ verdict, task, rulings: [] }),
+      }).replaceAll(TS, ts));
+      return session;
+    };
+
+    // Rounds 1 and 2: no per-task REV-6 warning on stdout or stderr.
+    for (let i = 1; i <= 2; i++) {
+      const s = makeSession(`t1-r${i}`, { ts: `2026-11-20T10:0${i}:00.000Z` });
+      const res = cli(r.work, 'make', s);
+      assert.equal(res.status, 0, res.stderr);
+      assert.doesNotMatch(res.stdout, /Warning \(REV-6\)/);
+      assert.doesNotMatch(res.stderr, /Warning \(REV-6\)/);
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `Task 1 round ${i}`);
+    }
+
+    // Round 3 with verdict "approve" does NOT emit the REV-6 warning; verify on a second task.
+    for (let i = 1; i <= 2; i++) {
+      const s = makeSession(`t2-r${i}`, { task: '084-t2', ts: `2026-11-20T11:0${i}:00.000Z` });
+      assert.equal(cli(r.work, 'make', s).status, 0);
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `Task 2 round ${i}`);
+    }
+    const t2Approve = cli(r.work, 'make', makeSession('t2-r3', { task: '084-t2', verdict: 'approve', ts: '2026-11-20T11:03:00.000Z' }));
+    assert.equal(t2Approve.status, 0, t2Approve.stderr);
+    assert.doesNotMatch(t2Approve.stdout, /Warning \(REV-6\)/, 'approving at round 3 does not warn');
+    assert.doesNotMatch(t2Approve.stderr, /Warning \(REV-6\)/, 'approving at round 3 does not warn on stderr');
+    git(r.work, 'add', '-A');
+    git(r.work, 'commit', '-q', '-m', 'Task 2 round 3 approve');
+
+    // Task 1 round 3 with "changes needed": warns on stdout with REV-6 and counts.
+    const t1r3 = cli(r.work, 'make', makeSession('t1-r3', { ts: '2026-11-20T10:03:00.000Z' }));
+    assert.equal(t1r3.status, 0, t1r3.stderr);
+    assert.match(t1r3.stdout, /Warning \(REV-6\): Task 084-t1 is on review round 3\/4 \(slice total 6\/12, branch 6, task 3\/4\) with changes still needed\. Stop patching symptoms and rethink or split the task before running another round\./);
+    git(r.work, 'add', '-A');
+    git(r.work, 'commit', '-q', '-m', 'Task 1 round 3');
+
+    // countTaskReceipts counts only 084-t1 (3), not 084-t2 (3).
+    const taskCount = countTaskReceipts({ baseRef: 'origin/main', task: '084-t1', git: r.run, root: r.work });
+    assert.deepEqual(taskCount, { count: 3, hasRound: false });
+
+    // Task 1 round 4: allowed (still at cap 4), warns on stdout.
+    const t1r4Session = makeSession('t1-r4', { ts: '2026-11-20T10:04:00.000Z' });
+    const t1r4 = cli(r.work, 'make', t1r4Session);
+    assert.equal(t1r4.status, 0, t1r4.stderr);
+    assert.match(t1r4.stdout, /Warning \(REV-6\): Task 084-t1 is on review round 4\/4/);
+    git(r.work, 'add', '-A');
+    git(r.work, 'commit', '-q', '-m', 'Task 1 round 4');
+
+    // Task 1 round 5: hard STOP, no receipt written, ask auto-filed.
+    const beforeFiles = readdirSync(join(r.work, RECEIPT_DIR)).length;
+    const t1r5Session = makeSession('t1-r5', { ts: '2026-11-20T10:05:00.000Z' });
+    const t1r5 = cli(r.work, 'make', t1r5Session);
+    assert.equal(t1r5.status, 1);
+    assert.match(t1r5.stderr, /STOP: Review round 5 for task 084-t1 exceeds maxTaskReviewRounds \(4\) \(REV-6; slice total 8\/12, branch 8, task 5\/4\)/);
+    assert.match(t1r5.stderr, /An ask for Stephen was filed \(id [0-9a-f]+\)/);
+    assert.equal(readdirSync(join(r.work, RECEIPT_DIR)).length, beforeFiles, 'no receipt written on STOP');
+
+    // Refreshing round 4 from a moved session file still succeeds via roundKey dedup.
+    const movedR4 = join(r.dir, 'moved-t1-r4.jsonl');
+    writeFileSync(movedR4, readFileSync(t1r4Session, 'utf8'));
+    const refreshR4 = cli(r.work, 'make', movedR4);
+    assert.equal(refreshR4.status, 0, refreshR4.stderr);
+  } finally { r.cleanup(); }
+});
+
+test('REV-6 slice-wide brake: counts merged branches on baseRef + current branch (4 + 3 + 4 = 11 -> STOP), and extraReviewRoundSlices lifts both caps', () => {
+  const r = repo();
+  try {
+    const makeReview = (branch, name, { task, verdict = 'changes needed', ts }) => {
+      const sha = commitFile(r.work, 'src/app.js', `export const v = '${name}';\n`, `Work ${name}`);
+      const fp = need(r, 'origin/main').list.at(-1).fingerprint;
+      const session = join(r.dir, `${name}.jsonl`);
+      writeFileSync(session, claudeRecord({
+        fps: [{ fingerprint: fp, commit: sha }],
+        model: 'gpt-6.1-sol',
+        text: reply({ verdict, task, rulings: [] }),
+      }).replaceAll(TS, ts));
+      const res = cli(r.work, 'make', session);
+      return { session, res };
+    };
+
+    // Branch 1 for slice 084: 4 review rounds, then merged to main.
+    git(r.work, 'switch', '-q', 'main');
+    git(r.work, 'switch', '-q', '-c', 'build/084-task-1');
+    for (let i = 1; i <= 4; i++) {
+      const { res } = makeReview('build/084-task-1', `b1-r${i}`, { task: 't1', verdict: i === 4 ? 'approve' : 'changes needed', ts: `2026-11-21T10:0${i}:00.000Z` });
+      assert.equal(res.status, 0, res.stderr);
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `B1 receipt ${i}`);
+    }
+    git(r.work, 'switch', '-q', 'main');
+    git(r.work, 'merge', '-q', '--no-edit', 'build/084-task-1');
+    git(r.work, 'push', '-q', 'origin', 'main');
+
+    // Branch 2 for slice 084: 3 review rounds (slice total reaches 7), then merged to main.
+    git(r.work, 'switch', '-q', '-c', 'build/084-task-2');
+    for (let i = 1; i <= 3; i++) {
+      const { res } = makeReview('build/084-task-2', `b2-r${i}`, { task: 't2', verdict: i === 3 ? 'approve' : 'changes needed', ts: `2026-11-21T11:0${i}:00.000Z` });
+      assert.equal(res.status, 0, res.stderr);
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `B2 receipt ${i}`);
+    }
+    git(r.work, 'switch', '-q', 'main');
+    git(r.work, 'merge', '-q', '--no-edit', 'build/084-task-2');
+    git(r.work, 'push', '-q', 'origin', 'main');
+
+    // Unrelated slice 085 merged to main: must NOT count toward slice 084.
+    git(r.work, 'switch', '-q', '-c', 'build/085-unrelated');
+    for (let i = 1; i <= 3; i++) {
+      const { res } = makeReview('build/085-unrelated', `s85-r${i}`, { task: 'other-t1', verdict: 'approve', ts: `2026-11-21T12:0${i}:00.000Z` });
+      assert.equal(res.status, 0, res.stderr);
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `S85 receipt ${i}`);
+    }
+    git(r.work, 'switch', '-q', 'main');
+    git(r.work, 'merge', '-q', '--no-edit', 'build/085-unrelated');
+    git(r.work, 'push', '-q', 'origin', 'main');
+
+    // Branch 3 for slice 084: 3 rounds succeed (slice totals 8, 9, 10 with warnings), 4th round succeeds (11/12),
+    // and with an explicit base cap of 10 (or 12 on a 4th branch), exceeding maxReviewRounds hits STOP!
+    git(r.work, 'switch', '-q', 'main');
+    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ maxReviewRounds: 10 }), 'Pin slice cap 10 for test');
+    git(r.work, 'push', '-q', 'origin', 'main');
+    git(r.work, 'switch', '-q', '-c', 'build/084-task-3');
+    for (let i = 1; i <= 3; i++) {
+      const { res } = makeReview('build/084-task-3', `b3-r${i}`, { task: 't3', verdict: 'changes needed', ts: `2026-11-21T13:0${i}:00.000Z` });
+      assert.equal(res.status, 0, res.stderr);
+      assert.match(res.stdout, new RegExp(`Warning \\(REV-6\\): This branch is on review round ${7 + i} of 10 \\(slice total ${7 + i}/10, branch ${i}, task ${i}/4\\)`));
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `B3 receipt ${i}`);
+    }
+
+    // Confirm helper counts: branch has 3, slice has 10 (4 + 3 + 3, excluding slice 085's 3).
+    assert.deepEqual(countBranchReceipts({ baseRef: 'origin/main', git: r.run, root: r.work }), { count: 3, hasRound: false });
+    assert.deepEqual(countSliceReceipts({ baseRef: 'origin/main', slice: 84, git: r.run, root: r.work }), { count: 10, hasRound: false });
+
+    // 4th round on current branch (task round 4/4, branch round 4, slice total 11/10) -> STOP!
+    const beforeFiles = readdirSync(join(r.work, RECEIPT_DIR)).length;
+    const { session: b3r4Session, res: b3r4 } = makeReview('build/084-task-3', 'b3-r4', { task: 't3', verdict: 'changes needed', ts: '2026-11-21T13:04:00.000Z' });
+    assert.equal(b3r4.status, 1);
+    assert.match(b3r4.stderr, /STOP: Review round 11 exceeds maxReviewRounds \(10\) across slice 084 \(REV-6; slice total 11\/10, branch 4, task 4\/4\)/);
+    assert.equal(readdirSync(join(r.work, RECEIPT_DIR)).length, beforeFiles, 'no receipt written on slice STOP');
+
+    // Base-branch extraReviewRoundSlices lifts BOTH the slice-wide cap (round 11) and per-task cap (round 5).
+    git(r.work, 'switch', '-q', 'main');
+    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ maxReviewRounds: 10, extraReviewRoundSlices: [84] }), 'Allow slice 84 extra rounds');
+    git(r.work, 'push', '-q', 'origin', 'main');
+    git(r.work, 'switch', '-q', 'build/084-task-3');
+
+    const b3r4Allowed = cli(r.work, 'make', b3r4Session);
+    assert.equal(b3r4Allowed.status, 0, b3r4Allowed.stderr);
+    git(r.work, 'add', '-A');
+    git(r.work, 'commit', '-q', '-m', 'B3 receipt 4');
+
+    const { res: b3r5Allowed } = makeReview('build/084-task-3', 'b3-r5', { task: 't3', verdict: 'approve', ts: '2026-11-21T13:05:00.000Z' });
+    assert.equal(b3r5Allowed.status, 0, b3r5Allowed.stderr);
+  } finally { r.cleanup(); }
+});
+
+test('REV-6 config safety: base-branch maxTaskReviewRounds cannot be weakened locally, local can tighten, and null only disables when set on base', () => {
+  const r = repo();
+  try {
+    const sha = commitFile(r.work, 'src/app.js', 'export const one = 11;\n', 'Change app');
+    const fp = need(r, 'origin/main').list[0].fingerprint;
+    const makeRound = (n, task = '084-cfg') => {
+      const session = join(r.dir, `cfg-${task}-r${n}.jsonl`);
+      writeFileSync(session, claudeRecord({
+        fps: [{ fingerprint: fp, commit: sha }],
+        model: 'gpt-6.1-sol',
+        text: reply({ verdict: 'changes needed', task, rulings: [] }),
+      }).replaceAll(TS, `2026-11-22T10:${String(n).padStart(2, '0')}:00.000Z`));
+      return { session, res: cli(r.work, 'make', session) };
+    };
+
+    // Base sets maxTaskReviewRounds: 2.
+    git(r.work, 'switch', '-q', 'main');
+    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ maxTaskReviewRounds: 2 }), 'Base task cap 2');
+    git(r.work, 'push', '-q', 'origin', 'main');
+    git(r.work, 'switch', '-q', 'build/084-welcome');
+
+    for (let i = 1; i <= 2; i++) {
+      assert.equal(makeRound(i).res.status, 0);
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `Cfg receipt ${i}`);
+    }
+
+    // Local tries raising to 6 -> ignored, still stops at round 3 (cap 2).
+    writeFileSync(join(r.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxTaskReviewRounds: 6 }));
+    const raised = makeRound(3);
+    assert.equal(raised.res.status, 1);
+    assert.match(raised.res.stderr, /STOP: Review round 3 for task 084-cfg exceeds maxTaskReviewRounds \(2\)/);
+
+    // Local tries disabling with null -> ignored, still stops at round 3 (cap 2).
+    writeFileSync(join(r.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxTaskReviewRounds: null }));
+    const nulled = makeRound(3);
+    assert.equal(nulled.res.status, 1);
+    assert.match(nulled.res.stderr, /STOP: Review round 3 for task 084-cfg exceeds maxTaskReviewRounds \(2\)/);
+
+    // Local tightens to 1 -> takes the stricter local cap (1).
+    writeFileSync(join(r.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxTaskReviewRounds: 1 }));
+    const tightened = makeRound(3);
+    assert.equal(tightened.res.status, 1);
+    assert.match(tightened.res.stderr, /STOP: Review round 3 for task 084-cfg exceeds maxTaskReviewRounds \(1\)/);
+
+    // Invalid maxTaskReviewRounds fails loud with exit code 2.
+    writeFileSync(join(r.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxTaskReviewRounds: -1 }));
+    const bad = makeRound(3);
+    assert.equal(bad.res.status, 2);
+    assert.match(bad.res.stderr, /Settings could not be read:.*maxTaskReviewRounds/);
+
+    // Base sets maxTaskReviewRounds: null -> disables task cap unless local sets a stricter positive cap.
+    rmSync(join(r.work, 'scripts', 'kit.config.json'));
+    git(r.work, 'switch', '-q', 'main');
+    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ maxTaskReviewRounds: null }), 'Base disables task cap');
+    git(r.work, 'push', '-q', 'origin', 'main');
+    git(r.work, 'switch', '-q', 'build/084-welcome');
+
+    // Local sets stricter cap 2 while base is null -> local cap 2 still applies.
+    writeFileSync(join(r.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxTaskReviewRounds: 2 }));
+    const localStricter = makeRound(3);
+    assert.equal(localStricter.res.status, 1);
+    assert.match(localStricter.res.stderr, /STOP: Review round 3 for task 084-cfg exceeds maxTaskReviewRounds \(2\)/);
+
+    // Without stricter local cap, base null disables per-task stop cleanly.
+    rmSync(join(r.work, 'scripts', 'kit.config.json'));
+    const disabledOk = makeRound(3);
+    assert.equal(disabledOk.res.status, 0, disabledOk.res.stderr);
+
+    // Without any base kit.config.json (default cap 4), local cannot raise or disable maxTaskReviewRounds.
+    const noBase = repo();
+    try {
+      const nSha = commitFile(noBase.work, 'src/app.js', 'export const one = 11;\n', 'Change app');
+      const nFp = need(noBase, 'origin/main').list[0].fingerprint;
+      const nRound = (i) => {
+        const s = join(noBase.dir, `nb-${i}.jsonl`);
+        writeFileSync(s, claudeRecord({ fps: [{ fingerprint: nFp, commit: nSha }], model: 'gpt-6.1-sol', text: reply({ verdict: 'changes needed', task: '084-nb', rulings: [] }) }).replaceAll(TS, `2026-11-22T12:0${i}:00.000Z`));
+        return cli(noBase.work, 'make', s);
+      };
+      for (let i = 1; i <= 4; i++) {
+        assert.equal(nRound(i).status, 0);
+        git(noBase.work, 'add', '-A');
+        git(noBase.work, 'commit', '-q', '-m', `NB ${i}`);
+      }
+      writeFileSync(join(noBase.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxTaskReviewRounds: null }));
+      assert.equal(nRound(5).status, 1, 'local null cannot disable default cap when base has no config');
+      writeFileSync(join(noBase.work, 'scripts', 'kit.config.json'), JSON.stringify({ maxTaskReviewRounds: 9 }));
+      assert.equal(nRound(5).status, 1, 'local 9 cannot raise default cap 4 when base has no config');
+    } finally { noBase.cleanup(); }
+  } finally { r.cleanup(); }
+});
+
+test('additive slice field and backwards compatibility: slice omitted on non-slice branches, legacy receipts without slice work in gates and slice counting', () => {
+  assert.equal(branchSlice('build/084-welcome'), 84);
+  assert.equal(branchSlice('lead/kit-5-3-0'), null);
+  const r = repo();
+  try {
+    // Commit legacy receipts on main with NO "slice" field:
+    // 1) legacy receipt with "branch" matching slice 084
+    // 2) legacy receipt with only "task" matching slice 084
+    // 3) legacy receipt with no slice info at all (must be ignored cleanly)
+    // 4) legacy receipt for slice 085 (must not count for slice 084)
+    git(r.work, 'switch', '-q', 'main');
+    const legacy = (name, obj) => commitFile(r.work, `${RECEIPT_DIR}${name}.json`, `${JSON.stringify(obj, null, 2)}\n`, `Legacy ${name}`);
+    legacy('legacy-branch-1', { task: 't1', branch: 'build/084-part-1', verdict: 'changes needed', model: 'gpt-6.1-sol', tool: 'codex', at: '2026-11-10T10:01:00.000Z', session: '/old/1.jsonl', fingerprints: [], protectedTests: [] });
+    legacy('legacy-task-2', { task: '084-part-2', verdict: 'approve', model: 'gpt-6.1-sol', tool: 'codex', at: '2026-11-10T10:02:00.000Z', session: '/old/2.jsonl', fingerprints: [], protectedTests: [] });
+    legacy('legacy-unscoped-3', { task: 'lead-cleanup', verdict: 'approve', model: 'gpt-6.1-sol', tool: 'codex', at: '2026-11-10T10:03:00.000Z', session: '/old/3.jsonl', fingerprints: [], protectedTests: [] });
+    legacy('legacy-other-slice-4', { task: '085-other', branch: 'build/085-other', verdict: 'approve', model: 'gpt-6.1-sol', tool: 'codex', at: '2026-11-10T10:04:00.000Z', session: '/old/4.jsonl', fingerprints: [], protectedTests: [] });
+    git(r.work, 'push', '-q', 'origin', 'main');
+
+    // On a non-slice branch, receipt.mjs make omits "slice".
+    git(r.work, 'switch', '-q', '-c', 'lead/cleanup');
+    const leadSha = commitFile(r.work, 'src/app.js', 'export const one = 20;\n', 'Lead edit');
+    const leadFp = need(r, 'origin/main').list[0].fingerprint;
+    const leadSession = join(r.dir, 'lead.jsonl');
+    writeFileSync(leadSession, claudeRecord({ fps: [{ fingerprint: leadFp, commit: leadSha }], model: 'gpt-6.1-sol', text: reply({ task: 'lead-1', rulings: [] }) }));
+    const leadMade = cli(r.work, 'make', leadSession);
+    assert.equal(leadMade.status, 0, leadMade.stderr);
+    const leadReceiptFile = readdirSync(join(r.work, RECEIPT_DIR)).find((f) => f.startsWith('lead-1-'));
+    const leadSaved = JSON.parse(readFileSync(join(r.work, RECEIPT_DIR, leadReceiptFile), 'utf8'));
+    assert.equal('slice' in leadSaved, false, 'non-slice branch omits slice field');
+    git(r.work, 'add', '-A');
+    git(r.work, 'commit', '-q', '-m', 'Add lead receipt');
+
+    // On a slice branch (build/084-part-3), receipt.mjs make writes slice: 84, passes checkReceipts,
+    // and countSliceReceipts counts the 2 matching legacy receipts on baseRef + 1 on branch = 3,
+    // while deduping if a receipt with the same roundKey appears on both baseRef and branch.
+    git(r.work, 'switch', '-q', 'main');
+    git(r.work, 'switch', '-q', '-c', 'build/084-part-3');
+    const sha = commitFile(r.work, 'src/app.js', 'export const one = 30;\n', 'Slice 84 edit');
+    const fp = need(r, 'origin/main').list[0].fingerprint;
+    const session = join(r.dir, 's84.jsonl');
+    writeFileSync(session, claudeRecord({ fps: [{ fingerprint: fp, commit: sha }], model: 'gpt-6.1-sol', text: reply({ task: 't3', rulings: [] }) }));
+    const made = cli(r.work, 'make', session);
+    assert.equal(made.status, 0, made.stderr);
+    const sliceReceiptFile = readdirSync(join(r.work, RECEIPT_DIR)).find((f) => f.startsWith('t3-'));
+    const saved = JSON.parse(readFileSync(join(r.work, RECEIPT_DIR, sliceReceiptFile), 'utf8'));
+    assert.equal(saved.slice, 84);
+    git(r.work, 'add', '-A');
+    git(r.work, 'commit', '-q', '-m', 'Add slice 84 receipt');
+
+    // Receipts with additive slice field still verify cleanly in checkReceipts.
+    const gate = checkReceipts({ baseRef: 'origin/main', tip: 'HEAD', git: r.run, models: MODELS, isPaperwork: PAPER, protectedTests: GUARDED });
+    assert.deepEqual([gate.uncovered, gate.covered, gate.notes], [[], 1, []]);
+
+    // Duplicate roundKey of legacy-branch-1 on current branch must not double-count.
+    commitFile(r.work, `${RECEIPT_DIR}moved-legacy-1.json`, `${JSON.stringify({ task: 't1', slice: 84, verdict: 'changes needed', model: 'gpt-6.1-sol', tool: 'codex', at: '2026-11-10T10:01:00.000Z', session: '/moved/1.jsonl', fingerprints: [], protectedTests: [] }, null, 2)}\n`, 'Refreshed legacy receipt');
+    const sliceCount = countSliceReceipts({ baseRef: 'origin/main', slice: 84, git: r.run, root: r.work });
+    assert.deepEqual(sliceCount, { count: 3, hasRound: false });
+    const withExclude = countSliceReceipts({ baseRef: 'origin/main', slice: 84, git: r.run, root: r.work, excludeKey: roundKey(saved) });
+    assert.deepEqual(withExclude, { count: 2, hasRound: true });
+  } finally { r.cleanup(); }
+});
+
+test('Opus #2: normalizeTaskId strips trailing round markers so renaming TASK each round cannot bypass maxTaskReviewRounds', () => {
+  assert.equal(normalizeTaskId('099-t4-r1'), '099-t4');
+  assert.equal(normalizeTaskId('099-t4-r2'), '099-t4');
+  assert.equal(normalizeTaskId('099-t4_R3'), '099-t4');
+  assert.equal(normalizeTaskId('099-t4.r4'), '099-t4');
+  assert.equal(normalizeTaskId('099-t4-round5'), '099-t4');
+  assert.equal(normalizeTaskId('099-t4-r1-r2'), '099-t4');
+  assert.equal(normalizeTaskId('1'), '1');
+  assert.equal(normalizeTaskId('084-t1'), '084-t1');
+  assert.equal(normalizeTaskId('r1'), 'r1');
+  assert.equal(normalizeTaskId(''), '');
+
+  const r = repo();
+  try {
+    const sha = commitFile(r.work, 'src/app.js', 'export const one = 11;\n', 'Change app');
+    const fp = need(r, 'origin/main').list[0].fingerprint;
+    const makeWithTask = (n, task) => {
+      const session = join(r.dir, `suffix-${n}.jsonl`);
+      writeFileSync(session, claudeRecord({
+        fps: [{ fingerprint: fp, commit: sha }],
+        model: 'gpt-6.1-sol',
+        text: reply({ verdict: 'changes needed', task, rulings: [] }),
+      }).replaceAll(TS, `2026-11-23T10:0${n}:00.000Z`));
+      return cli(r.work, 'make', session);
+    };
+    const tasks = ['099-t4-r1', '099-t4-r2', '099-t4_R3', '099-t4.r4'];
+    for (let i = 0; i < tasks.length; i++) {
+      const res = makeWithTask(i + 1, tasks[i]);
+      assert.equal(res.status, 0, res.stderr);
+      if (i >= 2) assert.match(res.stdout, new RegExp(`Warning \\(REV-6\\): Task ${tasks[i].replace('.', '\\.')} is on review round ${i + 1}/4`));
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `Round ${i + 1}`);
+    }
+    assert.deepEqual(countTaskReceipts({ baseRef: 'origin/main', task: '099-t4-r5', git: r.run, root: r.work }), { count: 4, hasRound: false });
+    assert.deepEqual(countTaskReceipts({ baseRef: 'origin/main', task: '099-t4', git: r.run, root: r.work }), { count: 4, hasRound: false });
+    const r5 = makeWithTask(5, '099-t4-r5');
+    assert.equal(r5.status, 1);
+    assert.match(r5.stderr, /STOP: Review round 5 for task 099-t4-r5 exceeds maxTaskReviewRounds \(4\)/);
+  } finally { r.cleanup(); }
+});
+
+test('Opus #3 + Astra #1 + Opus #11: legacy receipts without slice/branch are recovered from merge commit subjects and skip git show on unrelated slices', () => {
+  assert.equal(subjectSlice('Merge pull request #829 from Stephen-Garner/build/105-core-foundation-4'), 105);
+  assert.equal(subjectSlice("Merge branch 'lead/084-fix'"), 84);
+  assert.equal(subjectSlice('docs(105): add receipt'), 105);
+  assert.equal(subjectSlice('Slice 099: cleanup'), 99);
+  assert.equal(subjectSlice('Merge pull request #792 from Stephen-Garner/lead/kit-5-2-1-sync'), null);
+
+  const r = repo();
+  try {
+    const legacyJson = (task, at, extra = {}) => `${JSON.stringify({ task, verdict: 'approve', model: 'gpt-6.2-astra', tool: 'codex', at, session: `/old/${task}-${at}.jsonl`, fingerprints: [], protectedTests: [], ...extra }, null, 2)}\n`;
+    const mergePr = (branchName, mergeSubject, files) => {
+      git(r.work, 'switch', '-q', 'main');
+      git(r.work, 'switch', '-q', '-c', branchName);
+      for (const [file, content, msg] of files) commitFile(r.work, file, content, msg);
+      git(r.work, 'switch', '-q', 'main');
+      git(r.work, 'merge', '-q', '--no-ff', '-m', mergeSubject, branchName);
+    };
+
+    // Two merged PRs for slice 105 with bare numeric tasks "1" and "3" and NO slice/branch field (UniLex shape).
+    mergePr('tmp-105-core', 'Merge pull request #829 from Stephen-Garner/build/105-core-foundation-4', [
+      [`${RECEIPT_DIR}1-0cb5369e.json`, legacyJson('1', '2026-11-24T10:01:00.000Z'), 'Receipt 1'],
+      [`${RECEIPT_DIR}1-3b9895f1.json`, legacyJson('1', '2026-11-24T10:02:00.000Z'), 'Receipt 2'],
+      [`${RECEIPT_DIR}1-612aba22.json`, legacyJson('1', '2026-11-24T10:03:00.000Z'), 'Receipt 3'],
+      [`${RECEIPT_DIR}1-d3884119.json`, legacyJson('1', '2026-11-24T10:04:00.000Z'), 'Receipt 4'],
+    ]);
+    mergePr('tmp-105-server', 'Merge pull request #830 from Stephen-Garner/build/105-server-translate-4', [
+      [`${RECEIPT_DIR}3-91858c4d.json`, legacyJson('3', '2026-11-24T11:01:00.000Z'), 'Receipt 5'],
+      [`${RECEIPT_DIR}3-b9d8a596.json`, legacyJson('3', '2026-11-24T11:02:00.000Z'), 'Receipt 6'],
+      [`${RECEIPT_DIR}3-f000b08d.json`, legacyJson('3', '2026-11-24T11:03:00.000Z'), 'Receipt 7'],
+    ]);
+    // Unrelated slice 108 merged PR: must NOT count for slice 105 and must NOT trigger git show.
+    mergePr('tmp-108-picker', 'Merge pull request #825 from Stephen-Garner/build/108-app-language-picker-2', [
+      [`${RECEIPT_DIR}1-362e7198.json`, legacyJson('1', '2026-11-24T09:01:00.000Z'), 'Receipt 108a'],
+      [`${RECEIPT_DIR}1-362e7199.json`, legacyJson('1', '2026-11-24T09:02:00.000Z'), 'Receipt 108b'],
+    ]);
+    // Fallback: a merge commit without a slice in its subject, whose inner commit names docs(105).
+    mergePr('tmp-misc', 'Merge pull request #831 from Stephen-Garner/misc-cleanup', [
+      [`${RECEIPT_DIR}4-aaaa1111.json`, legacyJson('4', '2026-11-24T12:01:00.000Z'), 'docs(105): add review receipt'],
+    ]);
+    git(r.work, 'push', '-q', 'origin', 'main');
+    git(r.work, 'switch', '-q', '-c', 'build/105-next');
+
+    const sliceMap = baseReceiptSlicesFromGit('origin/main', r.run);
+    assert.equal(sliceMap.get(`${RECEIPT_DIR}1-0cb5369e.json`), 105);
+    assert.equal(sliceMap.get(`${RECEIPT_DIR}1-362e7198.json`), 108);
+
+    const shownPaths = [];
+    const trackingGit = (args, input) => {
+      if (args[0] === 'show' && args[1]?.includes(RECEIPT_DIR)) shownPaths.push(args[1]);
+      return r.run(args, input);
+    };
+    const counted = countSliceReceipts({ baseRef: 'origin/main', slice: 105, git: trackingGit, root: r.work });
+    assert.deepEqual(counted, { count: 8, hasRound: false });
+    assert.equal(shownPaths.some((p) => p.includes('362e7198') || p.includes('362e7199')), false, 'unrelated slice 108 receipts skip git show');
+  } finally { r.cleanup(); }
+});
+
+test('Astra #2 + Opus #5: tampered slice field is rejected by receiptMatches/checkReceipts and still counted for its true slice', () => {
+  const core = buildReceipt(codexRecord(), '/tmp/reviewer.jsonl');
+  assert.equal(receiptMatches(core, { ...core, slice: 84 }, 84), true);
+  assert.equal(receiptMatches(core, { ...core, slice: 999 }, 84), false);
+  assert.equal(receiptMatches(core, core, 84), true, 'legacy receipt without slice still matches');
+  assert.equal(receiptMatches(core, { ...core, slice: 999 }, null), true);
+
+  const r = repo();
+  try {
+    // Merge a receipt on build/105-core whose written.slice was tampered to 999.
+    git(r.work, 'switch', '-q', 'main');
+    git(r.work, 'switch', '-q', '-c', 'tmp-105-tamper');
+    commitFile(r.work, `${RECEIPT_DIR}1-tampered.json`, `${JSON.stringify({ task: '1', slice: 999, verdict: 'approve', model: 'gpt-6.2-astra', tool: 'codex', at: '2026-11-24T10:01:00.000Z', session: '/old/1.jsonl', fingerprints: [], protectedTests: [] }, null, 2)}\n`, 'Tampered receipt');
+    git(r.work, 'switch', '-q', 'main');
+    git(r.work, 'merge', '-q', '--no-ff', '-m', 'Merge pull request #829 from Stephen-Garner/build/105-core-foundation-4', 'tmp-105-tamper');
+    git(r.work, 'push', '-q', 'origin', 'main');
+
+    git(r.work, 'switch', '-q', '-c', 'build/105-part-2');
+    assert.deepEqual(countSliceReceipts({ baseRef: 'origin/main', slice: 105, git: r.run, root: r.work }), { count: 1, hasRound: false }, 'tampered slice on baseRef still counts for introducing slice 105');
+    assert.deepEqual(countSliceReceipts({ baseRef: 'origin/main', slice: 999, git: r.run, root: r.work }), { count: 0, hasRound: false }, 'tampered slice cannot move receipt to slice 999');
+
+    // On build/105-part-2, make a real approving receipt (slice: 105), verify checkReceipts passes,
+    // then tamper slice -> 999 and verify checkReceipts rejects it.
+    const sha = commitFile(r.work, 'src/app.js', 'export const one = 55;\n', 'Slice 105 code');
+    const fp = need(r, 'origin/main').list[0].fingerprint;
+    const session = join(r.dir, 's105.jsonl');
+    writeFileSync(session, codexRecord({ fps: [{ fingerprint: fp, commit: sha }], model: 'gpt-6.1-sol', text: reply({ task: 't2', rulings: [] }) }));
+    assert.equal(cli(r.work, 'make', session).status, 0);
+    const file = readdirSync(join(r.work, RECEIPT_DIR)).find((f) => f.startsWith('t2-'));
+    git(r.work, 'add', '-A');
+    git(r.work, 'commit', '-q', '-m', 'Honest slice 105 receipt');
+    assert.deepEqual(checkReceipts({ baseRef: 'origin/main', tip: 'HEAD', git: r.run, models: MODELS, isPaperwork: PAPER, protectedTests: GUARDED }).uncovered, []);
+
+    const tampered = { ...JSON.parse(readFileSync(join(r.work, RECEIPT_DIR, file), 'utf8')), slice: 999 };
+    commitFile(r.work, `${RECEIPT_DIR}${file}`, `${JSON.stringify(tampered, null, 2)}\n`, 'Tamper slice field');
+    const bad = checkReceipts({ baseRef: 'origin/main', tip: 'HEAD', git: r.run, models: MODELS, isPaperwork: PAPER, protectedTests: GUARDED });
+    assert.equal(bad.uncovered.length, 1, 'tampered slice field fails checkReceipts');
+    assert.match(bad.notes.join('\n'), /does not match its session record; not counted/);
+    assert.deepEqual(countSliceReceipts({ baseRef: 'origin/main', slice: 105, git: r.run, root: r.work }), { count: 2, hasRound: false }, 'tampered receipt on current branch still counts for slice 105');
+  } finally { r.cleanup(); }
+});
+
+test('Astra #5: receiptPath hashes core receipt without slice so refreshing an old receipt keeps the exact filename', () => {
+  const core = buildReceipt(codexRecord(), '/tmp/reviewer.jsonl');
+  assert.equal(receiptPath({ ...core, slice: 84 }), receiptPath(core), 'additive slice field does not change filename');
+
+  const r = repo();
+  try {
+    const sha = commitFile(r.work, 'src/app.js', 'export const one = 11;\n', 'Change app');
+    const fp = need(r, 'origin/main').list[0].fingerprint;
+    const session = join(r.dir, 'old-review.jsonl');
+    writeFileSync(session, claudeRecord({ fps: [{ fingerprint: fp, commit: sha }], model: 'gpt-6.1-sol', text: reply({ task: '084-t1', rulings: [] }) }));
+    const oldReceipt = buildReceipt(readFileSync(session, 'utf8'), session);
+    const oldPath = receiptPath(oldReceipt);
+    commitFile(r.work, oldPath, `${JSON.stringify(oldReceipt, null, 2)}\n`, 'Legacy receipt without slice');
+
+    // Refreshing the same session on slice branch build/084-welcome reuses the exact filename without duplicating.
+    const refreshed = cli(r.work, 'make', session);
+    assert.equal(refreshed.status, 0, refreshed.stderr);
+    assert.match(refreshed.stdout, new RegExp(`^Already there ${oldPath.replace('.', '\\.')}:`));
+    assert.deepEqual(readdirSync(join(r.work, RECEIPT_DIR)), [oldPath.slice(RECEIPT_DIR.length)]);
+  } finally { r.cleanup(); }
+});
+
+test('Opus #6: maxReviewRounds: 0 with unset maxTaskReviewRounds disables both caps and succeeds without a base branch', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'receipt-nobase-'));
+  try {
+    git(dir, 'init', '-q', '-b', 'feature/solo');
+    for (const [k, v] of [['user.email', 'test@example.com'], ['user.name', 'Test'], ['commit.gpgsign', 'false']]) git(dir, 'config', k, v);
+    commitFile(dir, 'scripts/kit.config.json', JSON.stringify({ maxReviewRounds: 0 }), 'Disable review cap');
+    const session = join(dir, 'solo.jsonl');
+    writeFileSync(session, claudeRecord({ model: 'gpt-6.1-sol', text: reply({ task: 'solo-1', rulings: [] }) }));
+
+    const ok = cli(dir, 'make', session);
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.equal(readdirSync(join(dir, RECEIPT_DIR)).length, 1);
+
+    // If maxTaskReviewRounds is explicitly set alongside maxReviewRounds: 0, base branch is still required.
+    writeFileSync(join(dir, 'scripts', 'kit.config.json'), JSON.stringify({ maxReviewRounds: 0, maxTaskReviewRounds: 4 }));
+    const needsBase = cli(dir, 'make', session);
+    assert.equal(needsBase.status, 1);
+    assert.match(needsBase.stderr, /Cannot count review rounds: no base branch found/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- Kit 5.3.1: convergence grace round (REV-6) ----------
+
+test('Kit 5.3.1 evaluateGraceRound: allows converging tail or post-approval check fix, refuses spirals, refused weakenings, and round 6', () => {
+  assert.equal(DEFAULT_MAX_REVIEW_ROUNDS, 12);
+  assert.equal(DEFAULT_GRACE_REVIEW_ROUND, true);
+
+  const rec = (n, important, verdict = 'changes needed', protectedTests = []) => ({
+    at: `2026-11-27T01:0${n}:00Z`,
+    verdict,
+    counts: important === null ? undefined : { important, nit: 0, preExisting: 0 },
+    protectedTests,
+  });
+
+  // Converging tail (7 -> 3 -> 2 -> 1): allowed at taskRound 5.
+  assert.equal(evaluateGraceRound([rec(1, 7), rec(2, 3), rec(3, 2), rec(4, 1)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 5 }).allowed, true);
+  // Converging tail holding at 1 (6 -> 2 -> 1 -> 1): allowed (down from round 1 and <= prevPrev).
+  assert.equal(evaluateGraceRound([rec(1, 6), rec(2, 2), rec(3, 1), rec(4, 1)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 5 }).allowed, true);
+  // Post-approval mechanical check fix (R4 approve): allowed at taskRound 5.
+  assert.equal(evaluateGraceRound([rec(1, 7), rec(2, 2), rec(3, 1), rec(4, 0, 'approve')], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 5 }).allowed, true);
+  // Never repeatable: round 6 always refused even if converging.
+  assert.equal(evaluateGraceRound([rec(1, 7), rec(2, 3), rec(3, 2), rec(4, 1), rec(5, 1)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 6, effectiveRound: 6 }).allowed, false);
+  // Never more than +1 past slice cap: round 14 refused.
+  assert.equal(evaluateGraceRound([rec(1, 7), rec(2, 1)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 3, effectiveRound: 14 }).allowed, false);
+  // Flat spiral (2 -> 2 -> 2 -> 2): refused.
+  assert.equal(evaluateGraceRound([rec(1, 2), rec(2, 2), rec(3, 2), rec(4, 2)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 5 }).allowed, false);
+  // Rising findings (1 -> 2 -> 3 -> 2): refused.
+  assert.equal(evaluateGraceRound([rec(1, 1), rec(2, 2), rec(3, 3), rec(4, 2)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 5 }).allowed, false);
+  // Too many remaining important findings (6 -> 4 -> 3 -> 3): refused.
+  assert.equal(evaluateGraceRound([rec(1, 6), rec(2, 4), rec(3, 3), rec(4, 3)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 5 }).allowed, false);
+  // Refused weakening (or legacy "weakened" spelling) on prior round: refused even with 0/1 important.
+  assert.equal(evaluateGraceRound([rec(1, 5), rec(2, 1, 'changes needed', [{ file: 'a.test.js', ruling: 'refused' }])], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 5 }).allowed, false);
+  assert.equal(evaluateGraceRound([rec(1, 5), rec(2, 0, 'approve', [{ file: 'a.test.js', ruling: 'weakened' }])], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 5 }).allowed, false);
+  // Single prior round with > 0 important proves no convergence: refused (Astra #2).
+  assert.equal(evaluateGraceRound([rec(1, 2)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 2, effectiveRound: 13 }).allowed, false);
+  // Second grace round in the same slice: refused (Astra #4).
+  assert.equal(evaluateGraceRound([rec(1, 6), rec(2, 1)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 10, priorGraceUsed: true }).allowed, false);
+  // Missing COUNT lines: refused.
+  assert.equal(evaluateGraceRound([rec(1, null), rec(2, null)], { maxTaskRounds: 4, maxRounds: 12, taskRound: 5, effectiveRound: 5 }).allowed, false);
+});
+
+test('Kit 5.3.1 receipt make: converging task earns 1 grace round (R5), hard-stops at R6, and respects base graceReviewRound: false', () => {
+  const r = repo();
+  try {
+    const sha = commitFile(r.work, 'src/app.js', 'export const one = 11;\n', 'Change app');
+    const fp = need(r, 'origin/main').list[0].fingerprint;
+    const makeCounted = (n, { task = '084-grace', verdict = 'changes needed', important = 1 } = {}) => {
+      const session = join(r.dir, `grace-${task}-${n}.jsonl`);
+      const body = `VERDICT: ${verdict}\nREVIEWED: abc1234\nTASK: ${task}\nCOUNT: ${important} important, 0 nit, 0 pre-existing\n\nFINDINGS\nnone\n\nPROTECTED TESTS\nnone\n`;
+      writeFileSync(session, claudeRecord({
+        fps: [{ fingerprint: fp, commit: sha }],
+        model: 'gpt-6.1-sol',
+        text: body,
+      }).replaceAll(TS, `2026-11-27T02:0${n}:00.000Z`));
+      return { session, res: cli(r.work, 'make', session) };
+    };
+
+    const counts = [6, 3, 2, 1];
+    for (let i = 0; i < 4; i++) {
+      const { res } = makeCounted(i + 1, { important: counts[i] });
+      assert.equal(res.status, 0, res.stderr);
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `Converging round ${i + 1}`);
+    }
+
+    // Round 5 earns the grace round!
+    const r5 = makeCounted(5, { verdict: 'changes needed', important: 1 });
+    assert.equal(r5.res.status, 0, r5.res.stderr);
+    assert.match(r5.res.stdout, /Grace round used \(REV-6\): converging tail \(6 -> 1 important\)/);
+    git(r.work, 'add', '-A');
+    git(r.work, 'commit', '-q', '-m', 'Grace round 5');
+
+    // Round 6 MUST hard-STOP (grace is never repeatable).
+    const r6 = makeCounted(6, { verdict: 'approve', important: 0 });
+    assert.equal(r6.res.status, 1);
+    assert.match(r6.res.stderr, /STOP: Review round 6 for task 084-grace exceeds maxTaskReviewRounds \(4\)/);
+
+    // Base setting graceReviewRound: false cannot be overridden locally.
+    git(r.work, 'switch', '-q', 'main');
+    commitFile(r.work, 'scripts/kit.config.json', JSON.stringify({ graceReviewRound: false }), 'Disable grace on base');
+    git(r.work, 'push', '-q', 'origin', 'main');
+    git(r.work, 'switch', '-q', '-c', 'build/084-nograce');
+    const sha2 = commitFile(r.work, 'src/app.js', 'export const one = 12;\n', 'Change app 2');
+    const fp2 = need(r, 'origin/main').list[0].fingerprint;
+    const make2 = (n, important) => {
+      const session = join(r.dir, `ng-${n}.jsonl`);
+      const body = `VERDICT: changes needed\nREVIEWED: abc1234\nTASK: 084-ng\nCOUNT: ${important} important, 0 nit, 0 pre-existing\n\nFINDINGS\nnone\n\nPROTECTED TESTS\nnone\n`;
+      writeFileSync(session, claudeRecord({ fps: [{ fingerprint: fp2, commit: sha2 }], model: 'gpt-6.1-sol', text: body }).replaceAll(TS, `2026-11-27T03:0${n}:00.000Z`));
+      return cli(r.work, 'make', session);
+    };
+    for (let i = 0; i < 4; i++) {
+      assert.equal(make2(i + 1, counts[i]).status, 0);
+      git(r.work, 'add', '-A');
+      git(r.work, 'commit', '-q', '-m', `NG round ${i + 1}`);
+    }
+    writeFileSync(join(r.work, 'scripts', 'kit.config.json'), JSON.stringify({ graceReviewRound: true }));
+    const blocked = make2(5, 0);
+    assert.equal(blocked.status, 1, 'base graceReviewRound: false cannot be overridden locally');
+    assert.match(blocked.stderr, /STOP: Review round 5 for task 084-ng exceeds maxTaskReviewRounds \(4\)/);
   } finally { r.cleanup(); }
 });

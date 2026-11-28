@@ -8,8 +8,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { checkNewPlans, parsePlan, parseTasks, tasksProblem, validatePlan } from './check-plans.mjs';
-import { eventsFile, readEvents } from './events.mjs';
-import { fillTemplate, listSlices, logTask, newPlan, readPlans, run, sliceStatus, sliceTasks, taskStates } from './slice.mjs';
+import { appendEvent, eventsFile, readEvents } from './events.mjs';
+import {
+  DEFAULT_MAX_PRS_PER_THREAD, DEFAULT_MAX_TASKS_PER_THREAD,
+  fillTemplate, formatRelayBaton, listSlices, logTask, newPlan, readPlans, run,
+  sliceHealth, sliceStatus, sliceTasks, taskStates,
+} from './slice.mjs';
 
 // A small plan template with the kit template's shape, so these tests run the same in the kit and in a
 // project (kit/sync.mjs copies this file into projects). The kit's real template is tested in kit/template.test.mjs.
@@ -419,4 +423,253 @@ test('a template shaped like the kit one fills into a plan the checker accepts a
   const fresh = { folder: 'active', file: '091-save-word.md', path, header: parsePlan(text).header, tasks: parseTasks(text) };
   assert.deepEqual(checkNewPlans({ plans: [fresh], changes: [{ status: 'A', path }], readBase: () => null }), [], 'and every rule for a new plan: log, tasks, invariants, risk, undo, owns, proof');
   assert.match(text, /^# 091: Save a word$/m);
+});
+
+// ---------- Relay Baton and Merge Odometer ----------
+
+test('sliceHealth: counts code PRs and distinct tasks since last slice-handoff, ignores paperwork PRs and other slices', () => {
+  assert.equal(DEFAULT_MAX_PRS_PER_THREAD, 2);
+  assert.equal(DEFAULT_MAX_TASKS_PER_THREAD, 2);
+
+  assert.deepEqual(sliceHealth(82, []), {
+    slice: 82,
+    codePrsSinceHandoff: 0,
+    tasksDoneSinceHandoff: 0,
+    maxPrs: 2,
+    maxTasks: 2,
+    totalCodePrs: 0,
+    handoffs: 0,
+    lastHandoffAt: null,
+    mergedPrs: [],
+    handoffRecommended: false,
+    reasons: [],
+  });
+
+  const events = [
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T01:00:00Z', data: { pr: 10, branch: 'build/082-a', tier: 'code' } },
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T01:10:00Z', data: { pr: 11, branch: 'lead/082-docs', tier: 'paperwork' } },
+    { type: 'pr-merged', slice: 84, at: '2026-11-25T01:15:00Z', data: { pr: 99, branch: 'build/084-other', tier: 'code' } },
+    { type: 'task-done', slice: 82, at: '2026-11-25T01:20:00Z', data: { task: 1 } },
+    { type: 'task-done', slice: 82, at: '2026-11-25T01:25:00Z', data: { task: 1 } }, // duplicate task number counts once
+  ];
+  const before = sliceHealth(82, events);
+  assert.equal(before.codePrsSinceHandoff, 1);
+  assert.equal(before.tasksDoneSinceHandoff, 1);
+  assert.equal(before.totalCodePrs, 1);
+  assert.equal(before.handoffs, 0);
+  assert.equal(before.mergedPrs.length, 2);
+  assert.equal(before.handoffRecommended, false);
+  assert.deepEqual(before.reasons, []);
+
+  // Second code PR and second distinct task trigger handoffRecommended with both reasons.
+  events.push(
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T02:00:00Z', data: { pr: 12, branch: 'build/082-b', tier: 'code' } },
+    { type: 'task-done', slice: 82, at: '2026-11-25T02:05:00Z', data: { task: 2 } },
+  );
+  const full = sliceHealth(82, events);
+  assert.equal(full.codePrsSinceHandoff, 2);
+  assert.equal(full.tasksDoneSinceHandoff, 2);
+  assert.equal(full.totalCodePrs, 2);
+  assert.equal(full.handoffRecommended, true);
+  assert.deepEqual(full.reasons, [
+    '2 code PRs merged since last handoff (limit 2)',
+    '2 tasks finished since last handoff (limit 2)',
+  ]);
+
+  // A slice-handoff event resets the per-thread counters while keeping historical totals.
+  events.push({ type: 'slice-handoff', slice: 82, at: '2026-11-25T03:00:00Z', data: { next: 'Task 3', threadPr: 20, note: null } });
+  const reset = sliceHealth(82, events);
+  assert.equal(reset.codePrsSinceHandoff, 0);
+  assert.equal(reset.tasksDoneSinceHandoff, 0);
+  assert.equal(reset.totalCodePrs, 2);
+  assert.equal(reset.handoffs, 1);
+  assert.equal(reset.lastHandoffAt, '2026-11-25T03:00:00Z');
+  assert.equal(reset.handoffRecommended, false);
+  assert.deepEqual(reset.reasons, []);
+
+  // Custom maxPrs limit triggers on 1 code PR.
+  events.push({ type: 'pr-merged', slice: 82, at: '2026-11-25T04:00:00Z', data: { pr: 13, branch: 'build/082-c', tier: 'code' } });
+  const custom = sliceHealth(82, events, { maxPrs: 1 });
+  assert.equal(custom.codePrsSinceHandoff, 1);
+  assert.equal(custom.handoffRecommended, true);
+  assert.deepEqual(custom.reasons, ['1 code PR merged since last handoff (limit 1)']);
+});
+
+test('formatRelayBaton stays compact (< 25 lines) even with many tasks and merged PRs', () => {
+  const manyTasks = Array.from({ length: 12 }, (_, i) => ({
+    n: i + 1,
+    title: `Task number ${i + 1}`,
+    state: i < 4 ? 'done' : i === 4 ? 'doing' : 'todo',
+    at: null,
+  }));
+  const manyPrs = Array.from({ length: 7 }, (_, i) => ({
+    pr: 10 + i,
+    branch: `build/082-t${i + 1}`,
+    tier: 'code',
+    at: '2026-11-25T01:00:00Z',
+  }));
+  const card = formatRelayBaton({
+    plan: { slice: 82, title: 'Search', status: 'in_progress', path: P82 },
+    taskSummary: { tasks: manyTasks, done: 4, total: 12 },
+    health: { slice: 82, codePrsSinceHandoff: 0, tasksDoneSinceHandoff: 0, maxPrs: 2, maxTasks: 2, handoffs: 2, handoffRecommended: false, reasons: [] },
+    lastHandoff: { at: '2026-11-25T03:00:00Z', data: { next: 'Finish task 5', threadPr: 42, note: 'Watch fixture port.' } },
+    mergedPrs: manyPrs,
+  });
+  const lines = card.split('\n');
+  assert.ok(lines.length < 25, `expected < 25 lines, got ${lines.length}`);
+  assert.match(card, /RELAY BATON: slice 082 - Search \(in_progress\)/);
+  assert.match(card, /Tasks: 4\/12 done, 1 doing, 7 todo/);
+  assert.match(card, /Merged PRs: \(\+2 earlier\)/);
+  assert.match(card, /Thread PR: #42/);
+  assert.match(card, /Handoffs: 2/);
+  assert.match(card, /Next: Finish task 5/);
+  assert.match(card, /Note: Watch fixture port\./);
+});
+
+test('CLI handoff --next, handoff --show (text & --json), and health before/after 2 code PRs and handoff reset', () => {
+  const r = repo({ [P82]: plan(82) });
+  try {
+    // Log task 1 done and task 2 started.
+    assert.equal(cli(r.dir, 'task', 'done', '1', '--slice', '82').code, 0);
+    assert.equal(cli(r.dir, 'task', 'start', '2', '--slice', '82').code, 0);
+
+    // 1 code PR + 1 paperwork PR: health is still OK.
+    appendEvent(r.dir, { type: 'pr-merged', slice: 82, data: { pr: 101, branch: 'build/082-order', tier: 'code' } }, OPTS);
+    appendEvent(r.dir, { type: 'pr-merged', slice: 82, data: { pr: 102, branch: 'lead/082-notes', tier: 'paperwork' } }, OPTS);
+    const h1 = cli(r.dir, 'health', '--slice', '82', '--json');
+    assert.equal(h1.code, 0, h1.err);
+    const h1Data = JSON.parse(h1.out);
+    assert.equal(h1Data.codePrsSinceHandoff, 1);
+    assert.equal(h1Data.totalCodePrs, 1);
+    assert.equal(h1Data.handoffRecommended, false);
+
+    // 2nd code PR: health now recommends handoff.
+    appendEvent(r.dir, { type: 'pr-merged', slice: 82, data: { pr: 103, branch: 'build/082-server', tier: 'code' } }, OPTS);
+    const h2 = cli(r.dir, 'health', '--slice', '82');
+    assert.equal(h2.code, 0, h2.err);
+    assert.match(h2.out, /slice 082 health: HANDOFF RECOMMENDED/);
+    assert.match(h2.out, /code PRs since handoff: 2 \/ 2 \(total: 2\)/);
+    assert.match(h2.out, /2 code PRs merged since last handoff \(limit 2\)/);
+
+    // Record handoff with --next, --thread-pr, and --note.
+    const handoff = cli(r.dir, 'handoff', '--slice', '82', '--next', 'Build task 3 result page on build/082-result', '--thread-pr', '88', '--note', 'Keep search sort stable.');
+    assert.equal(handoff.code, 0, handoff.err);
+    assert.ok(handoff.out.trimEnd().split('\n').length < 25, 'Relay Baton card is under 25 lines');
+    assert.match(handoff.out, /RELAY BATON: slice 082 - Search \(in_progress\)/);
+    assert.match(handoff.out, /Merged PRs: #101 \(code, build\/082-order\), #102 \(paperwork, lead\/082-notes\), #103 \(code, build\/082-server\)/);
+    assert.match(handoff.out, /Thread PR: #88/);
+    assert.match(handoff.out, /Handoffs: 1 \| Odometer: 0\/2 code PRs, 0\/2 tasks \[OK\]/);
+    assert.match(handoff.out, /Next: Build task 3 result page on build\/082-result/);
+    assert.match(handoff.out, /Note: Keep search sort stable\./);
+
+    // Event log has slice-handoff with exact payload.
+    const handoffEvents = readEvents(r.dir, { types: ['slice-handoff'] }).events;
+    assert.equal(handoffEvents.length, 1);
+    assert.deepEqual(handoffEvents[0].data, { next: 'Build task 3 result page on build/082-result', threadPr: 88, note: 'Keep search sort stable.' });
+
+    // Health is reset after slice-handoff.
+    const h3 = JSON.parse(cli(r.dir, 'health', '--slice', '82', '--json').out);
+    assert.equal(h3.codePrsSinceHandoff, 0);
+    assert.equal(h3.tasksDoneSinceHandoff, 0);
+    assert.equal(h3.totalCodePrs, 2);
+    assert.equal(h3.handoffs, 1);
+    assert.equal(h3.handoffRecommended, false);
+
+    // handoff --show (text & --json) returns the same Relay Baton card and structured data.
+    const showText = cli(r.dir, 'handoff', '--show', '--slice', '82');
+    assert.equal(showText.code, 0, showText.err);
+    assert.equal(showText.out, handoff.out);
+
+    const showJson = cli(r.dir, 'handoff', '--show', '--slice', '82', '--json');
+    assert.equal(showJson.code, 0, showJson.err);
+    const parsed = JSON.parse(showJson.out);
+    assert.equal(parsed.slice, 82);
+    assert.equal(parsed.title, 'Search');
+    assert.equal(parsed.threadPr, 88);
+    assert.equal(parsed.health.handoffs, 1);
+    assert.equal(parsed.mergedPrs.length, 3);
+    assert.equal(parsed.lastHandoff.data.next, 'Build task 3 result page on build/082-result');
+    assert.equal(parsed.baton, showText.out.trimEnd());
+
+    // Custom --max-prs on CLI works after 1 more code PR.
+    appendEvent(r.dir, { type: 'pr-merged', slice: 82, data: { pr: 104, branch: 'build/082-result', tier: 'code' } }, OPTS);
+    const hCustom = JSON.parse(cli(r.dir, 'health', '--slice', '82', '--max-prs', '1', '--json').out);
+    assert.equal(hCustom.handoffRecommended, true);
+    assert.equal(hCustom.maxPrs, 1);
+
+    // Custom --max-tasks on CLI works after 1 task done since handoff.
+    assert.equal(cli(r.dir, 'task', 'done', '2', '--slice', '82').code, 0);
+    const hMaxTasks = JSON.parse(cli(r.dir, 'health', '--slice', '82', '--max-prs', '5', '--max-tasks', '1', '--json').out);
+    assert.equal(hMaxTasks.handoffRecommended, true);
+    assert.equal(hMaxTasks.maxTasks, 1);
+    assert.deepEqual(hMaxTasks.reasons, ['1 task finished since last handoff (limit 1)']);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test('sliceHealth: deduplicates pr-merged events by PR number while keeping unnamed entries', () => {
+  // Duplicate pr-merged events for PR 21 must count as 1 merged PR, not 2.
+  const dup = sliceHealth(82, [
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T01:00:00Z', data: { pr: 21, branch: 'build/082-a', tier: 'code' } },
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T01:05:00Z', data: { pr: 21, branch: 'build/082-a', tier: 'code' } },
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T01:10:00Z', data: { pr: '21', branch: 'build/082-a', tier: 'code' } },
+  ]);
+  assert.equal(dup.codePrsSinceHandoff, 1);
+  assert.equal(dup.totalCodePrs, 1);
+  assert.equal(dup.mergedPrs.length, 1);
+  assert.equal(dup.mergedPrs[0].pr, 21);
+  assert.equal(dup.handoffRecommended, false);
+
+  // Duplicate pr-merged for a PR already merged before a handoff does not count after the handoff.
+  const crossHandoff = sliceHealth(82, [
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T01:00:00Z', data: { pr: 21, branch: 'build/082-a', tier: 'code' } },
+    { type: 'slice-handoff', slice: 82, at: '2026-11-25T02:00:00Z', data: { next: 'Task 2', threadPr: 21, note: null } },
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T02:05:00Z', data: { pr: 21, branch: 'build/082-a', tier: 'code' } },
+  ]);
+  assert.equal(crossHandoff.codePrsSinceHandoff, 0);
+  assert.equal(crossHandoff.totalCodePrs, 1);
+  assert.equal(crossHandoff.mergedPrs.length, 1);
+  assert.equal(crossHandoff.handoffRecommended, false);
+
+  // Unnamed pr-merged entries (pr == null or missing) are kept and counted individually.
+  const unnamed = sliceHealth(82, [
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T01:00:00Z', data: { pr: null, branch: 'build/082-a', tier: 'code' } },
+    { type: 'pr-merged', slice: 82, at: '2026-11-25T02:00:00Z', data: { branch: 'build/082-b', tier: 'code' } },
+  ]);
+  assert.equal(unnamed.codePrsSinceHandoff, 2);
+  assert.equal(unnamed.totalCodePrs, 2);
+  assert.equal(unnamed.mergedPrs.length, 2);
+  assert.equal(unnamed.handoffRecommended, true);
+});
+
+test('CLI handoff and health reject invalid flags with exit code 2 and write nothing', () => {
+  const r = repo({ [P82]: plan(82) });
+  try {
+    const cases = [
+      [['handoff', '--slice', '82'], /^Wrong usage: handoff needs --next/],
+      [['handoff', '--slice', '82', '--next', '   '], /^Refused: handoff needs a non-empty --next/],
+      [['handoff', '--show', '--next', 'Task 2', '--slice', '82'], /^Wrong usage: handoff --show cannot be combined/],
+      [['handoff', '--show', '--thread-pr', '10', '--slice', '82'], /^Wrong usage: handoff --show cannot be combined/],
+      [['handoff', '--next', 'Task 2', '--thread-pr', '0', '--slice', '82'], /^Wrong usage: --thread-pr needs a positive whole number/],
+      [['handoff', '--next', 'Task 2', '--thread-pr', 'abc', '--slice', '82'], /^Wrong usage: --thread-pr needs a positive whole number/],
+      [['handoff', '--next', 'Task 2', '--note', 'n'.repeat(301), '--slice', '82'], /^Refused: The note is 301 characters; shorten it to 300 or fewer\./],
+      [['handoff', '--next', 'Task 2', '--bogus', '1', '--slice', '82'], /^Wrong usage: unknown option --bogus/],
+      [['health', '--slice', '82', '--max-prs', '0'], /^Wrong usage: --max-prs needs a positive whole number/],
+      [['health', '--slice', '82', '--max-prs', 'two'], /^Wrong usage: --max-prs needs a positive whole number/],
+      [['health', '--slice', '82', '--max-tasks', '0'], /^Wrong usage: --max-tasks needs a positive whole number/],
+      [['health', '--slice', '82', '--max-tasks', 'two'], /^Wrong usage: --max-tasks needs a positive whole number/],
+      [['health', '--slice', '82', '--bogus', '1'], /^Wrong usage: unknown option --bogus/],
+    ];
+    for (const [argv, msg] of cases) {
+      const res = cli(r.dir, ...argv);
+      assert.equal(res.code, 2, argv.join(' '));
+      assert.match(res.err, msg, argv.join(' '));
+    }
+    const usageOut = cli(r.dir, 'health', '--slice', '82', '--bogus', '1').err;
+    assert.match(usageOut, /health \[--slice N\] \[--max-prs N\] \[--max-tasks N\] \[--json\]/);
+    assert.ok(!existsSync(eventsFile(r.dir)));
+  } finally {
+    r.cleanup();
+  }
 });

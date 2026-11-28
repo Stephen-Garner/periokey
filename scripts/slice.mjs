@@ -23,6 +23,12 @@
 //       A task number that is not in the plan is refused, with the numbers that exist.
 //   node scripts/slice.mjs status [--slice N] [--json]
 //       Each task of one slice with its state and the time of its newest event.
+//   node scripts/slice.mjs handoff --next "..." [--slice N] [--thread-pr N] [--note "..."] [--json]
+//       Records a slice-handoff event (relay baton) and prints the compact Relay Baton card.
+//   node scripts/slice.mjs handoff --show [--slice N] [--json]
+//       Prints the compact Relay Baton card for a slice from its plan and event log.
+//   node scripts/slice.mjs health [--slice N] [--max-prs N] [--max-tasks N] [--json]
+//       Prints the slice odometer (code PRs and tasks finished since the last handoff).
 //   node scripts/slice.mjs list [--status <status>] [--json]
 //       One line per plan: id, status, builder, reviewer, tasks done of total, title.
 //   node scripts/slice.mjs new <short-name> --title "..."
@@ -43,6 +49,8 @@ import { sliceId } from './token-ledger.mjs';
 export const TASK_STATE = Object.freeze({ 'task-started': 'doing', 'task-done': 'done', 'task-dropped': 'dropped' });
 export const TASK_TYPES = Object.keys(TASK_STATE);
 export const NOTE_MAX = 300;
+export const DEFAULT_MAX_PRS_PER_THREAD = 2;
+export const DEFAULT_MAX_TASKS_PER_THREAD = 2;
 const ACTIONS = { start: 'task-started', done: 'task-done', drop: 'task-dropped' };
 const FOLDERS = ['active', 'completed'];
 const PLAN_NAME = /^(\d{3})-[^/]*\.md$/;
@@ -51,6 +59,9 @@ const USAGE = 'Usage: node scripts/slice.mjs task start <n> [--slice N]\n'
   + '       node scripts/slice.mjs task done <n> [--slice N] [--note <text>]\n'
   + '       node scripts/slice.mjs task drop <n> --why <text> [--slice N]\n'
   + '       node scripts/slice.mjs status [--slice N] [--json]\n'
+  + '       node scripts/slice.mjs handoff --next <text> [--slice N] [--thread-pr N] [--note <text>] [--json]\n'
+  + '       node scripts/slice.mjs handoff --show [--slice N] [--json]\n'
+  + '       node scripts/slice.mjs health [--slice N] [--max-prs N] [--max-tasks N] [--json]\n'
   + '       node scripts/slice.mjs list [--status <status>] [--json]\n'
   + '       node scripts/slice.mjs new <short-name> --title <text>';
 
@@ -86,6 +97,154 @@ export function sliceTasks({ slice, status, tasks }, events) {
   if (status === 'done') states = states.map((t) => (t.state === 'dropped' ? t : { ...t, state: 'done' }));
   const kept = states.filter((t) => t.state !== 'dropped');
   return { tasks: states, done: kept.filter((t) => t.state === 'done').length, total: kept.length, logged };
+}
+
+// ---------- Relay baton and merge odometer ----------
+
+// Health / odometer for one slice from oldest-first events (readEvents).
+// Counts distinct code PRs merged (pr-merged with tier !== 'paperwork', deduplicated by
+// e.data?.pr when present; unnamed entries with pr == null still count) and distinct tasks
+// finished (task-done) since the newest slice-handoff event for this slice.
+export function sliceHealth(slice, events, opts = {}) {
+  const sl = Number(slice);
+  const all = Array.isArray(events) ? events : [];
+  const maxPrs = opts.maxPrs ?? DEFAULT_MAX_PRS_PER_THREAD;
+  const maxTasks = opts.maxTasks ?? DEFAULT_MAX_TASKS_PER_THREAD;
+
+  let lastHandoffIndex = -1;
+  let lastHandoff = null;
+  let handoffs = 0;
+  let totalCodePrs = 0;
+  const mergedPrs = [];
+  const seenPrs = new Set();
+  const keptPrMergedIndices = new Set();
+
+  for (let i = 0; i < all.length; i++) {
+    const e = all[i];
+    if (!e || e.slice !== sl) continue;
+    if (e.type === 'slice-handoff') {
+      handoffs++;
+      lastHandoffIndex = i;
+      lastHandoff = e;
+    } else if (e.type === 'pr-merged') {
+      const rawPr = e.data?.pr;
+      const hasPr = rawPr !== undefined && rawPr !== null && rawPr !== '';
+      if (hasPr) {
+        const key = String(rawPr);
+        if (seenPrs.has(key)) continue;
+        seenPrs.add(key);
+      }
+      keptPrMergedIndices.add(i);
+      const tier = e.data?.tier ?? 'code';
+      if (tier !== 'paperwork') totalCodePrs++;
+      mergedPrs.push({
+        pr: hasPr ? rawPr : null,
+        branch: e.data?.branch ?? e.branch ?? null,
+        tier,
+        at: e.at ?? null,
+      });
+    }
+  }
+
+  let codePrsSinceHandoff = 0;
+  const doneTasks = new Set();
+  for (let i = lastHandoffIndex + 1; i < all.length; i++) {
+    const e = all[i];
+    if (!e || e.slice !== sl) continue;
+    if (e.type === 'pr-merged' && keptPrMergedIndices.has(i) && (e.data?.tier ?? 'code') !== 'paperwork') {
+      codePrsSinceHandoff++;
+    } else if (e.type === 'task-done' && e.data?.task !== undefined && e.data?.task !== null) {
+      doneTasks.add(Number(e.data.task));
+    }
+  }
+
+  const tasksDoneSinceHandoff = doneTasks.size;
+  const reasons = [];
+  if (codePrsSinceHandoff >= maxPrs) {
+    reasons.push(`${codePrsSinceHandoff} code PR${codePrsSinceHandoff === 1 ? '' : 's'} merged since last handoff (limit ${maxPrs})`);
+  }
+  if (tasksDoneSinceHandoff >= maxTasks) {
+    reasons.push(`${tasksDoneSinceHandoff} task${tasksDoneSinceHandoff === 1 ? '' : 's'} finished since last handoff (limit ${maxTasks})`);
+  }
+
+  return {
+    slice: sl,
+    codePrsSinceHandoff,
+    tasksDoneSinceHandoff,
+    maxPrs,
+    maxTasks,
+    totalCodePrs,
+    handoffs,
+    lastHandoffAt: lastHandoff?.at ?? null,
+    mergedPrs,
+    handoffRecommended: reasons.length > 0,
+    reasons,
+  };
+}
+
+// Compact (< 25 lines) Relay Baton card for handing a slice to a fresh continuation thread.
+export function formatRelayBaton({ plan, taskSummary, health, lastHandoff, mergedPrs } = {}) {
+  const sl = plan?.slice ?? health?.slice ?? 0;
+  const title = plan?.title ?? 'no title';
+  const status = plan?.status ?? plan?.header?.status ?? 'unknown';
+  const tasks = taskSummary?.tasks ?? [];
+  const done = taskSummary?.done ?? 0;
+  const total = taskSummary?.total ?? 0;
+  const doing = tasks.filter((t) => t.state === 'doing');
+  const todo = tasks.filter((t) => t.state === 'todo');
+  const doneList = tasks.filter((t) => t.state === 'done');
+  const dropped = tasks.filter((t) => t.state === 'dropped');
+  const prs = mergedPrs ?? health?.mergedPrs ?? [];
+
+  const lines = [];
+  lines.push(`RELAY BATON: slice ${nnn(sl)} - ${title} (${status})`);
+  if (plan?.path) lines.push(`Plan: ${plan.path}`);
+
+  if (total === 0 && tasks.length === 0) {
+    lines.push('Tasks: no tasks');
+  } else {
+    const parts = [`${done}/${total} done`];
+    if (doing.length) parts.push(`${doing.length} doing`);
+    if (todo.length) parts.push(`${todo.length} todo`);
+    if (dropped.length) parts.push(`${dropped.length} dropped`);
+    lines.push(`Tasks: ${parts.join(', ')}`);
+    if (tasks.length <= 8) {
+      for (const t of tasks) lines.push(`  [${t.state}] ${t.n}. ${t.title}`);
+    } else {
+      const brief = (list, limit = 3) => {
+        const shown = list.slice(0, limit).map((t) => `#${t.n} ${t.title}`).join(', ');
+        return list.length > limit ? `${shown} (+${list.length - limit} more)` : shown;
+      };
+      if (doneList.length) lines.push(`  done (${doneList.length}): ${doneList.map((t) => `#${t.n}`).join(', ')}`);
+      if (doing.length) lines.push(`  doing (${doing.length}): ${brief(doing)}`);
+      if (todo.length) lines.push(`  todo (${todo.length}): ${brief(todo)}`);
+      if (dropped.length) lines.push(`  dropped (${dropped.length}): ${dropped.map((t) => `#${t.n}`).join(', ')}`);
+    }
+  }
+
+  if (prs.length === 0) {
+    lines.push('Merged PRs: none');
+  } else {
+    const formatPr = (p) => `#${p.pr ?? '?'} (${p.tier ?? 'code'}${p.branch ? `, ${p.branch}` : ''})`;
+    const shown = prs.slice(-5).map(formatPr).join(', ');
+    lines.push(`Merged PRs: ${prs.length > 5 ? `(+${prs.length - 5} earlier) ` : ''}${shown}`);
+  }
+
+  const threadPr = lastHandoff?.data?.threadPr ?? null;
+  lines.push(`Thread PR: ${threadPr !== null ? `#${threadPr}` : 'none'}`);
+
+  const handoffs = health?.handoffs ?? 0;
+  const codePrs = health?.codePrsSinceHandoff ?? 0;
+  const maxPrs = health?.maxPrs ?? DEFAULT_MAX_PRS_PER_THREAD;
+  const tasksDone = health?.tasksDoneSinceHandoff ?? 0;
+  const maxTasks = health?.maxTasks ?? DEFAULT_MAX_TASKS_PER_THREAD;
+  const badge = health?.handoffRecommended ? 'HANDOFF RECOMMENDED' : 'OK';
+  lines.push(`Handoffs: ${handoffs} | Odometer: ${codePrs}/${maxPrs} code PRs, ${tasksDone}/${maxTasks} tasks [${badge}]`);
+
+  const next = lastHandoff?.data?.next ?? null;
+  lines.push(`Next: ${next ?? '(none recorded yet)'}`);
+  if (lastHandoff?.data?.note) lines.push(`Note: ${lastHandoff.data.note}`);
+  return lines.join('\n');
 }
 
 // ---------- Finding plans ----------
@@ -209,6 +368,79 @@ export function sliceStatus(cwd, { slice } = {}) {
   return { slice: sl, title: plan.title, status, path: plan.path, ...sliceTasks({ slice: sl, status, tasks: plan.tasks }, readEvents(cwd, { types: TASK_TYPES }).events) };
 }
 
+const BATON_TYPES = [...TASK_TYPES, 'pr-merged', 'slice-handoff'];
+
+function buildBatonView(cwd, sl, plan, events) {
+  const status = plan.header.status ?? null;
+  const taskSummary = sliceTasks({ slice: sl, status, tasks: plan.tasks }, events);
+  const health = sliceHealth(sl, events);
+  const handoffEvents = events.filter((e) => e.slice === sl && e.type === 'slice-handoff');
+  const lastHandoff = handoffEvents.at(-1) ?? null;
+  const threadPr = [...handoffEvents].reverse().find((e) => e.data?.threadPr !== null && e.data?.threadPr !== undefined)?.data?.threadPr ?? null;
+  const batonHandoff = lastHandoff
+    ? { ...lastHandoff, data: { ...lastHandoff.data, threadPr: lastHandoff.data?.threadPr ?? threadPr } }
+    : null;
+  const planInfo = { slice: sl, title: plan.title, status, path: plan.path };
+  const baton = formatRelayBaton({ plan: planInfo, taskSummary, health, lastHandoff: batonHandoff, mergedPrs: health.mergedPrs });
+  return {
+    slice: sl,
+    title: plan.title,
+    status,
+    path: plan.path,
+    tasks: taskSummary,
+    health,
+    lastHandoff,
+    threadPr,
+    mergedPrs: health.mergedPrs,
+    baton,
+  };
+}
+
+// Records a slice-handoff event and returns the updated Relay Baton view.
+export function recordHandoff(cwd, { slice, next, threadPr = null, note = null } = {}, opts) {
+  const nextText = String(next ?? '').trim();
+  if (!nextText) throw refuse('handoff needs a non-empty --next "<exact next step>".');
+  let prNum = null;
+  if (threadPr !== null && threadPr !== undefined && threadPr !== '') {
+    if (!/^[1-9]\d*$/.test(String(threadPr))) throw usage('--thread-pr needs a positive whole number, such as 42.');
+    prNum = Number(threadPr);
+  }
+  const cleanNote = cleanText('note', note);
+  const sl = resolveSlice(cwd, slice);
+  const plan = findPlan(cwd, sl);
+  const event = appendEvent(cwd, {
+    type: 'slice-handoff',
+    slice: sl,
+    data: { next: nextText, threadPr: prNum, note: cleanNote },
+  }, opts);
+  const events = readEvents(cwd, { types: BATON_TYPES }).events;
+  return { event, ...buildBatonView(cwd, sl, plan, events) };
+}
+
+// Reads the plan and event log for a slice and returns its Relay Baton view.
+export function showHandoff(cwd, { slice } = {}) {
+  const sl = resolveSlice(cwd, slice);
+  const plan = findPlan(cwd, sl);
+  const events = readEvents(cwd, { types: BATON_TYPES }).events;
+  return buildBatonView(cwd, sl, plan, events);
+}
+
+// Reads the event log for a slice and computes its odometer health.
+export function checkSliceHealth(cwd, { slice, maxPrs, maxTasks } = {}) {
+  if (maxPrs !== undefined && maxPrs !== null && !/^[1-9]\d*$/.test(String(maxPrs))) {
+    throw usage('--max-prs needs a positive whole number, such as 2.');
+  }
+  if (maxTasks !== undefined && maxTasks !== null && !/^[1-9]\d*$/.test(String(maxTasks))) {
+    throw usage('--max-tasks needs a positive whole number, such as 2.');
+  }
+  const sl = resolveSlice(cwd, slice);
+  const events = readEvents(cwd, { types: ['pr-merged', 'task-done', 'slice-handoff'] }).events;
+  return sliceHealth(sl, events, {
+    maxPrs: maxPrs !== undefined && maxPrs !== null ? Number(maxPrs) : undefined,
+    maxTasks: maxTasks !== undefined && maxTasks !== null ? Number(maxTasks) : undefined,
+  });
+}
+
 // Every plan as a row: { id, status, builder, reviewer, done, total, title, path }. status filters.
 export function listSlices(cwd, { status = null } = {}) {
   if (status !== null && !STATUSES.includes(status)) throw usage(`--status must be one of: ${STATUSES.join(', ')}.`);
@@ -318,6 +550,39 @@ export function run(argv, io = {}) {
       else {
         const head = `slice ${nnn(s.slice)}: ${s.title ?? 'no title'} (${s.status ?? 'no status'}), ${countText(s)}${s.total ? ' done' : ''}`;
         out(`${head}\n${s.tasks.length ? `${pad(s.tasks.map((t) => [`  ${t.n}`, t.state, t.at ?? '-', t.title]))}\n` : ''}`);
+      }
+      return 0;
+    }
+    if (cmd === 'handoff') {
+      const o = parseFlags(rest, ['show', 'json']);
+      only(o, ['slice', 'next', 'thread-pr', 'note', 'show', 'json'], 0);
+      if (o.show) {
+        if (o.next !== undefined || o['thread-pr'] !== undefined || o.note !== undefined) {
+          throw usage('handoff --show cannot be combined with --next, --thread-pr, or --note.');
+        }
+        const view = showHandoff(cwd, { slice: o.slice });
+        out(o.json ? `${JSON.stringify(view)}\n` : `${view.baton}\n`);
+        return 0;
+      }
+      if (o.next === undefined) throw usage('handoff needs --next "<exact next step>" or --show.');
+      const view = recordHandoff(cwd, { slice: o.slice, next: o.next, threadPr: o['thread-pr'], note: o.note }, opts);
+      out(o.json ? `${JSON.stringify(view)}\n` : `${view.baton}\n`);
+      return 0;
+    }
+    if (cmd === 'health') {
+      const o = parseFlags(rest, ['json']);
+      only(o, ['slice', 'max-prs', 'max-tasks', 'json'], 0);
+      const h = checkSliceHealth(cwd, { slice: o.slice, maxPrs: o['max-prs'], maxTasks: o['max-tasks'] });
+      if (o.json) out(`${JSON.stringify(h)}\n`);
+      else {
+        const lines = [
+          `slice ${nnn(h.slice)} health: ${h.handoffRecommended ? 'HANDOFF RECOMMENDED' : 'OK'}`,
+          `  code PRs since handoff: ${h.codePrsSinceHandoff} / ${h.maxPrs} (total: ${h.totalCodePrs})`,
+          `  tasks done since handoff: ${h.tasksDoneSinceHandoff} / ${h.maxTasks}`,
+          `  handoffs: ${h.handoffs}`,
+        ];
+        if (h.reasons.length) lines.push(`  reasons: ${h.reasons.join('; ')}`);
+        out(`${lines.join('\n')}\n`);
       }
       return 0;
     }
