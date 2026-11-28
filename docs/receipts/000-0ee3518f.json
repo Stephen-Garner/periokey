@@ -1,0 +1,93 @@
+{
+  "task": "000",
+  "verdict": "approve",
+  "model": "gpt-6.2-astra",
+  "tool": "codex",
+  "at": "2026-11-26T04:19:57.559Z",
+  "session": "/Users/stephengarner/.codex/sessions/2026/11/25/rollout-2026-11-25T21-17-53-01a21613-0101-7553-9f6a-dfcd6ca0d1e0.jsonl",
+  "fingerprints": [
+    {
+      "fingerprint": "73fbe5ad4bce80f144c9a3c15fd0cf8ddbdb8081",
+      "commit": "e997fb5b1ba904a702d69724046554337bf6d82d"
+    },
+    {
+      "fingerprint": "b7b3475e7f37f7dee07de2d5a50cc9a902ec4a9e",
+      "commit": "c453b09459b5aa0a071333311466c7a40450aa60"
+    },
+    {
+      "fingerprint": "35dfaf2adf0b4a11ee131f31ec5827c7e7663527",
+      "commit": "e9668df357437aef1ed2c76334befa5eb9767fc6"
+    },
+    {
+      "fingerprint": "b965e9558e6337efb6a3f9e599b4775c042347bf",
+      "commit": "2addfe31c4ee6dde8dfd160d55b78fb41c3357fa"
+    },
+    {
+      "fingerprint": "640d209511d5d2d5d8e9e57657d2c02b85af1281",
+      "commit": "6784691ed0e126cde04d558dacdf261e72f195fe"
+    },
+    {
+      "fingerprint": "b15e37514c727dc2a41d1ac325ba4faff16e3a0d",
+      "commit": "647a0cb3ba1320fdaf89c106f882cd0d0e99cdc3"
+    },
+    {
+      "fingerprint": "d721f78eec30fced3fa401d59e06ea3d6c9b85e8",
+      "commit": "57471a30ee01884d5faf9dc72e91aecaec3534e8"
+    },
+    {
+      "fingerprint": "cecdffa02df3ad0b898f39d19883fca3be199705",
+      "commit": "51d2df441ca701e03a298b6da8dde7c5f79a7d2e"
+    },
+    {
+      "fingerprint": "4ffd50fdfa8b97b5064a5ee1035e5780b497a07e",
+      "commit": "ae9d9e9d8b23333080250cfee30b42aa7b2ebd80"
+    }
+  ],
+  "protectedTests": [
+    {
+      "file": "R4.1: accepted. Saving now stops when an existing settings file cannot be read. The test checks that the file keeps its original contents. A separate test confirms that saving still works when the file is missing.\n- R4.2: accepted. Clearing a key removes its old file copy as well. The restart test confirms the cleared key stays gone and the other key survives. A failed cleanup returns an error.\n- eslint.config.mjs",
+      "ruling": "allowed"
+    },
+    {
+      "file": "src/ai-filter.test.ts",
+      "ruling": "allowed"
+    },
+    {
+      "file": "src/engine.test.ts",
+      "ruling": "allowed"
+    },
+    {
+      "file": "src/keymap.test.ts",
+      "ruling": "allowed"
+    },
+    {
+      "file": "src/stt.test.ts",
+      "ruling": "allowed"
+    },
+    {
+      "file": "tsconfig.json",
+      "ruling": "allowed"
+    }
+  ],
+  "weakenings": [
+    "1c74c89eb4be",
+    "2d476dd40271",
+    "77deed5b1ff6",
+    "c1a8c22c2ed2",
+    "e73512945ac4",
+    "e86101694b76"
+  ],
+  "counts": {
+    "important": 0,
+    "nit": 0,
+    "preExisting": 0
+  },
+  "level": "deep",
+  "security": "clear",
+  "checklist": [
+    {
+      "id": "CL-1",
+      "answer": "does not apply"
+    }
+  ]
+}

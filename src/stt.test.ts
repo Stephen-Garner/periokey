@@ -12,6 +12,8 @@ import {
   deepgramUrl,
   openAiSessionUpdate,
   KEYTERMS,
+  browserConnect,
+  toBase64,
 } from "./stt.ts";
 
 function result(transcript: string, isFinal: boolean, speechFinal: boolean) {
@@ -174,16 +176,22 @@ test("the OpenAI silence threshold follows the setting", () => {
   );
 });
 
-type Seen = { ready: number; errors: string[]; auth: string };
+type Seen = {
+  ready: number;
+  errors: string[];
+  auth: string;
+  protocol: string;
+};
 
 async function withServer(
   run: (url: string, server: WebSocketServer, seen: Seen) => Promise<void>,
 ): Promise<void> {
   const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
   await once(server, "listening");
-  const seen: Seen = { ready: 0, errors: [], auth: "" };
+  const seen: Seen = { ready: 0, errors: [], auth: "", protocol: "" };
   server.on("connection", (_client, request) => {
     seen.auth = request.headers.authorization ?? "";
+    seen.protocol = String(request.headers["sec-websocket-protocol"] ?? "");
   });
   const { port } = server.address() as AddressInfo;
   try {
@@ -242,4 +250,25 @@ test("OpenAI signs in with an Authorization header, not a browser subprotocol", 
     assert.equal(seen.auth, `Bearer ${fake}`);
     session.close();
   });
+});
+
+test("OpenAI in the desktop app signs in with the browser subprotocol", async () => {
+  await withServer(async (url, _server, seen) => {
+    const session = openAiProvider(
+      "abc",
+      "gpt-4o-transcribe",
+      url,
+      300,
+      browserConnect,
+    ).start(handlersFor(seen));
+    await until(() => seen.ready === 1);
+    assert.equal(seen.auth, "");
+    assert.equal(seen.protocol, "realtime, openai-insecure-api-key.abc");
+    session.close();
+  });
+});
+
+test("audio is base64 encoded the same way Buffer does it", () => {
+  const bytes = new Uint8Array(70000).map((_, i) => (i * 7) % 256);
+  assert.equal(toBase64(bytes), Buffer.from(bytes).toString("base64"));
 });

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PerioKey",
+  "version": "../package.json",
+  "identifier": "com.periokey.desktop",
+  "build": {
+    "frontendDist": "../desktop",
+    "beforeBuildCommand": "pnpm run build:desktop",
+    "beforeDevCommand": "pnpm run build:desktop"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "pill",
+        "url": "pill.html",
+        "title": "PerioKey",
+        "width": 380,
+        "height": 46,
+        "resizable": false,
+        "maximizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "focusable": false,
+        "visible": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required"
+      },
+      {
+        "label": "settings",
+        "url": "settings.html",
+        "title": "PerioKey Settings",
+        "width": 780,
+        "height": 860,
+        "minWidth": 520,
+        "minHeight": 480,
+        "visible": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src ipc: http://ipc.localhost https://api.openai.com wss://api.openai.com wss://api.deepgram.com"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk0RDMwRTlEOTNDQTg2MzQKUldRMGhzcVRuUTdUbEdqVlhKREliWk54NWJMc21yQUFNSUUrWVZEUFZlVk5udkY4cFBtcVoxT3UK",
+      "endpoints": [
+        "https://github.com/Stephen-Garner/periokey/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

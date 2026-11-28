@@ -264,6 +264,13 @@ function applyToChart(actions) {
       chart.bleed.delete(chart.cursor);
     } else if (action.type === "skip") {
       chart.cursor = Math.min(chart.cursor + 1, end);
+    } else if (action.type === "prev_tooth") {
+      // why: matches Eaglesoft's Left key, which jumps back one 3-site tooth group.
+      chart.cursor = Math.max(
+        Math.floor((chart.cursor - 1) / (SITES_PER_TOOTH / 2)) *
+          (SITES_PER_TOOTH / 2),
+        0,
+      );
     } else if (action.tooth < 1 || action.tooth > TEETH) {
       showNote(
         `Tooth ${action.tooth} is outside the 1–${TEETH} practice chart.`,

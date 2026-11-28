@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>PerioKey Settings</title>
+    <link rel="stylesheet" href="style.css" />
+    <script type="module" src="js/settings.js"></script>
+  </head>
+  <body class="settings">
+    <header class="top">
+      <img src="js/periokey-logo.svg" alt="" />
+      <h1>PerioKey</h1>
+      <span id="status" class="lbl">paused</span>
+    </header>
+
+    <section class="pane">
+      <div class="pane-head">
+        <h2>Mode</h2>
+        <div class="seg" role="group" aria-label="Mode">
+          <button type="button" data-mode="practice" aria-pressed="true">
+            practice
+          </button>
+          <button type="button" data-mode="live" aria-pressed="false">
+            live
+          </button>
+        </div>
+      </div>
+      <div class="pane-body">
+        <p id="note" class="msg" data-tone="warn"></p>
+        <div class="flds">
+          <label class="fld"
+            ><span>speech service</span>
+            <select id="provider" class="in">
+              <option value="openai">OpenAI</option>
+              <option value="deepgram">Deepgram</option>
+            </select>
+          </label>
+          <label class="fld"
+            ><span>openai key</span
+            ><input
+              id="openaiKey"
+              class="in"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+          /></label>
+          <label class="fld"
+            ><span>deepgram key</span
+            ><input
+              id="deepgramKey"
+              class="in"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+          /></label>
+          <label class="fld"
+            ><span>microphone</span
+            ><select id="mic" class="in"></select
+          ></label>
+          <label class="fld"
+            ><span>start/stop hotkey</span
+            ><input id="hotkey" class="in" spellcheck="false"
+          /></label>
+          <label class="fld"
+            ><span>dental software</span
+            ><select id="profile" class="in"></select
+          ></label>
+        </div>
+      </div>
+    </section>
+
+    <section class="pane">
+      <div class="pane-head">
+        <h2>Eaglesoft keys</h2>
+        <span class="lbl"
+          >marked keys are not yet checked in real eaglesoft</span
+        >
+      </div>
+      <div class="pane-body">
+        <div class="flds" id="keys">
+          <label class="fld"
+            ><span>window title contains</span
+            ><input data-key="window_match" class="in"
+          /></label>
+          <label class="fld"
+            ><span>program file name<i>unverified</i></span
+            ><input data-key="program_match" class="in" spellcheck="false"
+          /></label>
+          <label class="fld"
+            ><span>bleeding</span><input data-key="bleeding" class="in"
+          /></label>
+          <label class="fld"
+            ><span>undo</span><input data-key="undo" class="in"
+          /></label>
+          <label class="fld"
+            ><span>skip</span><input data-key="skip" class="in"
+          /></label>
+          <label class="fld"
+            ><span>previous tooth<i>unverified</i></span
+            ><input data-key="prev_tooth" class="in"
+          /></label>
+          <label class="fld"
+            ><span>10 to 15 mm<i>unverified</i></span
+            ><select data-key="ten_to_fifteen" class="in"></select
+          ></label>
+          <label class="fld"
+            ><span>delay between keys (ms)</span
+            ><input
+              data-key="inter_key_delay_ms"
+              class="in"
+              type="number"
+              min="0"
+              max="1000"
+          /></label>
+        </div>
+        <div class="row">
+          <button id="save" class="btn primary" type="button">save</button>
+          <button id="clearKeys" class="btn" type="button">
+            clear saved keys
+          </button>
+          <span id="saved" class="msg"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="pane" id="practice">
+      <div class="pane-head">
+        <h2>Practice chart</h2>
+        <div class="row" style="margin: 0">
+          <button id="copyLog" class="btn" type="button">copy stats</button>
+          <button id="clear" class="btn" type="button">clear</button>
+        </div>
+      </div>
+      <div class="pane-body">
+        <form id="simulate" class="row" style="margin: 0 0 12px">
+          <input
+            id="phrase"
+            class="in"
+            style="flex: 1"
+            placeholder="type a phrase, for example: three two three"
+            autocomplete="off"
+          />
+          <button class="btn" type="submit">send</button>
+        </form>
+        <div id="grid" class="grid"></div>
+        <p id="cadence" class="msg" style="margin-top: 12px"></p>
+        <ol id="log" class="log"></ol>
+      </div>
+    </section>
+  </body>
+</html>

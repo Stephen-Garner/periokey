@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>PerioKey</title>
+    <link rel="stylesheet" href="style.css" />
+    <script type="module" src="js/pill.js"></script>
+  </head>
+  <body class="pill">
+    <div class="frame" id="frame" data-status="Paused">
+      <div class="grip dots" data-tauri-drag-region title="Drag"></div>
+      <button id="go" class="go" type="button" data-on="false">
+        <span class="sq"></span><span id="goText">Start</span>
+      </button>
+      <div class="readout">
+        <span id="label" class="lbl">paused</span>
+        <span id="strip" class="strip"></span>
+      </div>
+      <div id="eq" class="eq" aria-hidden="true"></div>
+      <button
+        id="gear"
+        class="icon"
+        type="button"
+        title="Settings and practice"
+      >
+        ⚙
+      </button>
+      <button id="hide" class="icon" type="button" title="Hide to tray">
+        ×
+      </button>
+    </div>
+  </body>
+</html>

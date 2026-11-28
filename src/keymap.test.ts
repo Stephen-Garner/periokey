@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import {
   encodeActions,
-  loadProfiles,
   validateProfile,
   describeKey,
   type Keystroke,
@@ -11,6 +10,7 @@ import {
   type TenToFifteenStyle,
 } from "./keymap.ts";
 import { parsePhrase, type Action } from "./parser.ts";
+import { loadProfiles } from "./load-profiles.ts";
 
 const profiles = loadProfiles(
   fileURLToPath(new URL("../profiles", import.meta.url)),
@@ -149,4 +149,27 @@ test("tooth edits and jumps have no keys yet, so the whole phrase is refused", (
       name,
     );
   }
+});
+
+test("prev_tooth presses the profile's previous-tooth key, Left in Eaglesoft", () => {
+  const redo: Action[] = [
+    { type: "prev_tooth" },
+    { type: "depth", value: 3 },
+    { type: "depth", value: 2 },
+  ];
+  assert.deepEqual(
+    encodeActions(redo, profile("eaglesoft"))?.map(describeKey),
+    ["←", "3", "2"],
+  );
+  assert.throws(
+    () => validateProfile({ ...profile("generic"), prev_tooth: "banana" }),
+    /prev_tooth must be/,
+  );
+});
+
+test("a profile with no prev_tooth key stays valid, and a tooth redo then types nothing", () => {
+  const { prev_tooth: _unused, ...rest } = profile("generic");
+  const noRedo = validateProfile(rest);
+  assert.equal(noRedo.prev_tooth, undefined);
+  assert.equal(encodeActions([{ type: "prev_tooth" }], noRedo), null);
 });
